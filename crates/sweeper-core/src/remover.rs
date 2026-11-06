@@ -1,6 +1,7 @@
 //! Executes a removal plan with a policy re-check before every mutation and
 //! records Trash moves so they can be undone.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -277,30 +278,184 @@ impl UndoLog {
             .iter()
             .position(|e| e.id == id)
             .ok_or_else(|| RestoreError::UnknownEntry(id.to_string()))?;
-        let entry = entries[index].clone();
-
-        let sane = |p: &Path| {
-            p.is_absolute()
-                && p.components()
-                    .all(|c| !matches!(c, Component::ParentDir | Component::CurDir))
-        };
-        if !sane(&entry.original) || !sane(&entry.trash_location) {
-            return Err(RestoreError::InvalidEntry);
-        }
-        if fs::symlink_metadata(&entry.trash_location).is_err() {
-            return Err(RestoreError::TrashItemMissing(entry.trash_location));
-        }
-        if fs::symlink_metadata(&entry.original).is_ok() {
-            return Err(RestoreError::OriginalExists(entry.original));
-        }
-        if let Some(parent) = entry.original.parent() {
-            fs::create_dir_all(parent).map_err(io_err)?;
-        }
-        fs::rename(&entry.trash_location, &entry.original).map_err(io_err)?;
-
+        let original = restore_entry(&entries[index], None)?;
         entries.remove(index);
         self.write(&entries).map_err(io_err)?;
-        Ok(entry.original)
+        Ok(original)
+    }
+
+    /// Entries grouped by batch, newest batch first. `in_trash` tells whether
+    /// the item can still be restored.
+    pub fn batches(&self) -> io::Result<Vec<UndoBatch>> {
+        let mut batches: Vec<UndoBatch> = Vec::new();
+        for entry in self.entries()? {
+            let in_trash = fs::symlink_metadata(&entry.trash_location).is_ok();
+            let status = UndoEntryStatus { entry, in_trash };
+            match batches
+                .iter_mut()
+                .find(|b| b.batch_id == status.entry.batch_id)
+            {
+                Some(batch) => {
+                    batch.timestamp = batch.timestamp.max(status.entry.timestamp);
+                    batch.size = batch.size.saturating_add(status.entry.size);
+                    batch.entries.push(status);
+                }
+                None => batches.push(UndoBatch {
+                    batch_id: status.entry.batch_id.clone(),
+                    timestamp: status.entry.timestamp,
+                    size: status.entry.size,
+                    entries: vec![status],
+                }),
+            }
+        }
+        // Stable sort keeps the log order for batches with equal timestamps.
+        batches.reverse();
+        batches.sort_by_key(|b| std::cmp::Reverse(b.timestamp));
+        Ok(batches)
+    }
+
+    /// Restores several entries with one log rewrite. Each restore is
+    /// independent and refuses on its own; a missing parent folder is
+    /// re-created only inside the locations `policy` allows.
+    pub fn restore_many(
+        &self,
+        ids: &[String],
+        policy: &PathPolicy,
+    ) -> Vec<(String, Result<PathBuf, RestoreError>)> {
+        let io_err = |e: io::Error| RestoreError::Io(e.to_string());
+        let mut entries = match self.entries() {
+            Ok(e) => e,
+            Err(e) => {
+                return ids
+                    .iter()
+                    .map(|id| {
+                        (
+                            id.clone(),
+                            Err(io_err(io::Error::new(e.kind(), e.to_string()))),
+                        )
+                    })
+                    .collect()
+            }
+        };
+        let mut results = Vec::with_capacity(ids.len());
+        let mut restored = HashSet::new();
+        for id in ids {
+            let entry = entries
+                .iter()
+                .find(|e| e.id == *id && !restored.contains(&e.id));
+            let result = match entry {
+                Some(entry) => restore_entry(entry, Some(policy)),
+                None => Err(RestoreError::UnknownEntry(id.clone())),
+            };
+            if result.is_ok() {
+                restored.insert(id.clone());
+            }
+            results.push((id.clone(), result));
+        }
+        if !restored.is_empty() {
+            entries.retain(|e| !restored.contains(&e.id));
+            if let Err(e) = self.write(&entries) {
+                // The items are back in place; only the bookkeeping failed.
+                for (_, result) in results.iter_mut().filter(|(_, r)| r.is_ok()) {
+                    *result = Err(io_err(io::Error::new(
+                        e.kind(),
+                        format!("restored, but the undo list could not be updated: {e}"),
+                    )));
+                }
+            }
+        }
+        results
+    }
+
+    /// Drops entries from the log without touching any file, for items that
+    /// are no longer in the Trash. Returns how many entries were dropped.
+    pub fn forget(&self, ids: &[String]) -> io::Result<usize> {
+        let mut entries = self.entries()?;
+        let before = entries.len();
+        entries.retain(|e| !ids.contains(&e.id));
+        let dropped = before - entries.len();
+        if dropped > 0 {
+            self.write(&entries)?;
+        }
+        Ok(dropped)
+    }
+}
+
+/// An [`UndoEntry`] together with whether its Trash item still exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoEntryStatus {
+    pub entry: UndoEntry,
+    pub in_trash: bool,
+}
+
+/// All entries created by one removal run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoBatch {
+    pub batch_id: String,
+    /// Unix seconds of the newest entry.
+    pub timestamp: u64,
+    pub entries: Vec<UndoEntryStatus>,
+    pub size: u64,
+}
+
+/// Moves one Trash item back. With a `policy`, a missing parent folder is
+/// re-created one level at a time and each new level must be allowed.
+fn restore_entry(entry: &UndoEntry, policy: Option<&PathPolicy>) -> Result<PathBuf, RestoreError> {
+    let io_err = |e: io::Error| RestoreError::Io(e.to_string());
+    let sane = |p: &Path| {
+        p.is_absolute()
+            && p.components()
+                .all(|c| !matches!(c, Component::ParentDir | Component::CurDir))
+    };
+    if !sane(&entry.original) || !sane(&entry.trash_location) {
+        return Err(RestoreError::InvalidEntry);
+    }
+    if fs::symlink_metadata(&entry.trash_location).is_err() {
+        return Err(RestoreError::TrashItemMissing(entry.trash_location.clone()));
+    }
+    if fs::symlink_metadata(&entry.original).is_ok() {
+        return Err(RestoreError::OriginalExists(entry.original.clone()));
+    }
+    if let Some(parent) = entry.original.parent() {
+        match policy {
+            Some(policy) => create_parents(parent, policy)?,
+            None => fs::create_dir_all(parent).map_err(io_err)?,
+        }
+    }
+    fs::rename(&entry.trash_location, &entry.original).map_err(io_err)?;
+    Ok(entry.original.clone())
+}
+
+/// Creates the missing folders of `dir` top-down. A level the policy does not
+/// allow is removed again together with the ones created before it.
+fn create_parents(dir: &Path, policy: &PathPolicy) -> Result<(), RestoreError> {
+    let mut missing: Vec<&Path> = dir
+        .ancestors()
+        .take_while(|a| fs::symlink_metadata(a).is_err())
+        .collect();
+    missing.reverse();
+    let mut created: Vec<&Path> = Vec::new();
+    for level in missing {
+        let made = fs::create_dir(level).map_err(|e| RestoreError::Io(e.to_string()));
+        let allowed = made.is_ok() && policy.check(level).is_ok();
+        if made.is_ok() {
+            created.push(level);
+        }
+        if let Err(e) = made {
+            roll_back(&created);
+            return Err(e);
+        }
+        if !allowed {
+            roll_back(&created);
+            return Err(RestoreError::InvalidEntry);
+        }
+    }
+    Ok(())
+}
+
+fn roll_back(created: &[&Path]) {
+    for dir in created.iter().rev() {
+        let _ = fs::remove_dir(dir);
     }
 }
 
