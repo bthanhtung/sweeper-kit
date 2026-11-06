@@ -11,11 +11,11 @@ use std::time::Duration;
 use serde::Serialize;
 use sweeper_core::{
     apply_preset as core_apply_preset, brew_zap_command as core_brew_zap_command, compute_sizes,
-    full_disk_access, team_id, AppCatalog, AppInfo, CacheScanner, CleanPlan, CleanReport,
-    CleanScan, Cleaner, FdaStatus, LeftoverScanner, OrphanFinder, OrphanScan, Preset, Progress,
-    QuitOutcome, RemovalMode, RemovalPlan, RemovalReport, RemovedApp, RemovedApps, Remover,
-    RunningApp, ScanResult, StepResult, UndoBatch, UndoEntry, UndoLog, UninstallReport,
-    Uninstaller,
+    find_receipts, full_disk_access, restore_admin_entries, team_id, AppCatalog, AppInfo,
+    CacheScanner, CleanPlan, CleanReport, CleanScan, Cleaner, FdaStatus, LeftoverScanner,
+    OrphanFinder, OrphanScan, Preset, Progress, QuitOutcome, Receipt, RemovalMode, RemovalPlan,
+    RemovalReport, RemovedApp, RemovedApps, Remover, RestoreError, RunningApp, ScanResult,
+    StepResult, UndoBatch, UndoEntry, UndoLog, UninstallReport, Uninstaller,
 };
 
 use crate::state::{lock, save_settings as store_settings, AppContext, AppState, Settings};
@@ -28,6 +28,9 @@ pub const QUIT_GRACE: Duration = Duration::from_secs(5);
 const NO_SCAN: &str = "Scan first.";
 /// Error when the selection contains nothing that can be removed.
 const NOTHING_SELECTED: &str = "Nothing selected that can be removed. Scan again.";
+/// Why administrator operations are disabled when the helper is missing.
+const ADMIN_UNAVAILABLE: &str =
+    "The privileged helper is missing (development build), so administrator operations are disabled";
 /// Apps sized per batch, so sizes reach the UI progressively.
 const SIZE_BATCH: usize = 8;
 
@@ -111,7 +114,8 @@ pub fn scan_app(ctx: &AppContext, path: &Path, cancel: &AtomicBool) -> Result<Sc
         app.team_id = team_id(&app.path, &*ctx.runner);
     }
     let installed = ctx.installed_apps();
-    let scanner = LeftoverScanner::new(&ctx.env, &ctx.rules, &ctx.policy, &*ctx.spotlight);
+    let scanner = LeftoverScanner::new(&ctx.env, &ctx.rules, &ctx.policy, &*ctx.spotlight)
+        .with_system_policy(ctx.system_policy.clone());
     let mut result = scanner.scan(&app, &installed, cancel);
     if cancel.load(Ordering::Relaxed) {
         return Err(CANCELLED.into());
@@ -130,9 +134,14 @@ pub fn plan_removal(scan: &ScanResult) -> RemovalPlan {
     RemovalPlan::from_scan(scan)
 }
 
-fn with_uninstaller<R>(ctx: &AppContext, body: impl FnOnce(&Uninstaller<'_>) -> R) -> R {
+fn with_uninstaller<R>(
+    ctx: &AppContext,
+    forget_receipts: Vec<String>,
+    body: impl FnOnce(&Uninstaller<'_>) -> R,
+) -> R {
     let installed = ctx.installed_apps();
-    let scanner = LeftoverScanner::new(&ctx.env, &ctx.rules, &ctx.policy, &*ctx.spotlight);
+    let scanner = LeftoverScanner::new(&ctx.env, &ctx.rules, &ctx.policy, &*ctx.spotlight)
+        .with_system_policy(ctx.system_policy.clone());
     let remover = Remover::new(
         &ctx.env,
         &ctx.policy,
@@ -147,12 +156,34 @@ fn with_uninstaller<R>(ctx: &AppContext, body: impl FnOnce(&Uninstaller<'_>) -> 
         &remover,
         &scanner,
         &installed,
-    );
+    )
+    .with_system_policy(ctx.system_policy.clone())
+    .with_forget_receipts(forget_receipts);
+    let uninstaller = match &ctx.helper {
+        Some(helper) => uninstaller.with_admin_helper(helper),
+        None => uninstaller,
+    };
     body(&uninstaller)
 }
 
+/// Whether the privileged helper is present, i.e. administrator operations
+/// can be offered.
+pub fn admin_available(ctx: &AppContext) -> bool {
+    ctx.helper.is_some()
+}
+
+/// Installer receipts of the app at `path`. The app is looked up in the
+/// server-side catalog copy; nothing from the UI is trusted.
+pub fn receipts(ctx: &AppContext, path: &Path) -> Result<Vec<Receipt>, String> {
+    let mut app = resolve_app(ctx, path)?;
+    if app.team_id.is_none() {
+        app.team_id = team_id(&app.path, &*ctx.runner);
+    }
+    Ok(find_receipts(&*ctx.runner, &app))
+}
+
 pub fn running_instances(ctx: &AppContext, scan: &ScanResult) -> Vec<RunningApp> {
-    with_uninstaller(ctx, |u| u.running_instances(scan))
+    with_uninstaller(ctx, Vec::new(), |u| u.running_instances(scan))
 }
 
 /// Quits the running instances of the scanned app, waiting [`QUIT_GRACE`].
@@ -167,7 +198,7 @@ pub fn quit_apps_within(
     allow_force: bool,
     grace: Duration,
 ) -> QuitOutcome {
-    with_uninstaller(ctx, |u| {
+    with_uninstaller(ctx, Vec::new(), |u| {
         let apps = u.running_instances(scan);
         for app in &apps {
             ctx.log
@@ -178,13 +209,28 @@ pub fn quit_apps_within(
 }
 
 /// Removes the checked items (Trash unless the setting says otherwise).
+/// `forget_receipts` must be package ids that [`receipts`] finds for the app;
+/// anything else rejects the whole request before anything is removed.
 pub fn uninstall(
     ctx: &AppContext,
     scan: &ScanResult,
+    forget_receipts: &[String],
     progress: &mut dyn FnMut(Progress),
 ) -> Result<UninstallReport, String> {
     if scan.app.is_apple {
         return Err("Apple apps are read-only and cannot be uninstalled".into());
+    }
+    let mut forget: Vec<String> = Vec::new();
+    if !forget_receipts.is_empty() {
+        let known = receipts(ctx, &scan.app.path)?;
+        for id in forget_receipts {
+            if !known.iter().any(|r| r.pkg_id == *id) {
+                return Err(format!("{id} is not an installer receipt of this app"));
+            }
+            if !forget.contains(id) {
+                forget.push(id.clone());
+            }
+        }
     }
     let mode = if ctx.settings.delete_immediately {
         RemovalMode::Delete
@@ -192,7 +238,9 @@ pub fn uninstall(
         RemovalMode::Trash
     };
     ctx.log.record("uninstall", &scan.app.path);
-    Ok(with_uninstaller(ctx, |u| u.run(scan, mode, progress)))
+    Ok(with_uninstaller(ctx, forget, |u| {
+        u.run(scan, mode, progress)
+    }))
 }
 
 /// The cask of `app` as looked up in the installed list, never trusting the UI.
@@ -210,7 +258,7 @@ pub fn brew_zap_command(ctx: &AppContext, app: &AppInfo) -> Option<Vec<String>> 
 pub fn brew_zap(ctx: &AppContext, app: &AppInfo) -> StepResult {
     let app = installed_copy(ctx, app);
     ctx.log.record("brew-zap", &app.path);
-    with_uninstaller(ctx, |u| u.run_brew_zap(&app))
+    with_uninstaller(ctx, Vec::new(), |u| u.run_brew_zap(&app))
 }
 
 pub fn fda_status(ctx: &AppContext) -> FdaStatus {
@@ -371,12 +419,32 @@ pub fn history(ctx: &AppContext) -> Result<Vec<UndoBatch>, String> {
         .map_err(|e| format!("Could not read the history: {e}"))
 }
 
-/// Moves the entries `ids` back to where they came from.
+/// Moves the entries `ids` back to where they came from. Entries removed with
+/// administrator access are restored together through the helper (one
+/// password prompt); the others from the Trash.
 pub fn restore(ctx: &AppContext, ids: &[String]) -> Vec<RestoreOutcome> {
     let log = UndoLog::for_env(&ctx.env);
     ctx.log.record("restore", log.path());
-    log.restore_many(ids, &ctx.policy)
+    let admin_ids: HashSet<String> = log
+        .entries()
+        .unwrap_or_default()
         .into_iter()
+        .filter(|e| e.admin && ids.contains(&e.id))
+        .map(|e| e.id)
+        .collect();
+    let (admin_ids, normal_ids): (Vec<String>, Vec<String>) =
+        ids.iter().cloned().partition(|id| admin_ids.contains(id));
+
+    let mut results = log.restore_many(&normal_ids, &ctx.policy);
+    if !admin_ids.is_empty() {
+        results.extend(restore_admin(ctx, &log, &admin_ids));
+    }
+    // Answer in the order requested.
+    ids.iter()
+        .filter_map(|id| {
+            let at = results.iter().position(|(r, _)| r == id)?;
+            Some(results.swap_remove(at))
+        })
         .map(|(id, result)| match result {
             Ok(path) => RestoreOutcome {
                 id,
@@ -390,6 +458,26 @@ pub fn restore(ctx: &AppContext, ids: &[String]) -> Vec<RestoreOutcome> {
             },
         })
         .collect()
+}
+
+/// Restores admin entries with one authorization; every entry fails with the
+/// same reason when the helper is missing or the request is refused.
+fn restore_admin(
+    ctx: &AppContext,
+    log: &UndoLog,
+    ids: &[String],
+) -> Vec<(String, Result<PathBuf, RestoreError>)> {
+    let failure = |why: String| {
+        ids.iter()
+            .map(|id| (id.clone(), Err(RestoreError::Io(why.clone()))))
+            .collect()
+    };
+    let Some(helper) = &ctx.helper else {
+        return failure(ADMIN_UNAVAILABLE.into());
+    };
+    ctx.log.record("restore-admin", log.path());
+    restore_admin_entries(&*ctx.runner, helper, &ctx.env, log, ids)
+        .unwrap_or_else(|e| failure(e.to_string()))
 }
 
 /// Drops entries whose Trash item is gone. Entries still in the Trash are
@@ -512,14 +600,29 @@ pub mod wrappers {
         app: AppHandle,
         state: State<'_, AppState>,
         scan: ScanResult,
+        forget_receipts: Vec<String>,
     ) -> Result<UninstallReport, String> {
         let ctx = state.ctx.clone();
         blocking(move || {
-            super::uninstall(&read(&ctx), &scan, &mut |p| {
+            super::uninstall(&read(&ctx), &scan, &forget_receipts, &mut |p| {
                 let _ = app.emit("uninstall-progress", p);
             })
         })
         .await?
+    }
+
+    #[tauri::command]
+    pub async fn receipts(
+        state: State<'_, AppState>,
+        path: PathBuf,
+    ) -> Result<Vec<Receipt>, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || super::receipts(&read(&ctx), &path)).await?
+    }
+
+    #[tauri::command]
+    pub fn admin_available(state: State<'_, AppState>) -> bool {
+        super::admin_available(&read(&state.ctx))
     }
 
     #[tauri::command]

@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use sweeper_core::{
     cleaner_roots, is_valid_bundle_id, ActionLog, AppInfo, CleanOptions, CleanRules, CleanScan,
     CommandRunner, Env, OrphanRules, OrphanScan, PathPolicy, Processes, RealProcesses, RealRunner,
-    RealSpotlight, RealToolLocator, RealTrasher, RuleSet, Spotlight, ToolLocator, Trasher,
+    RealSpotlight, RealToolLocator, RealTrasher, RuleSet, Spotlight, SystemPolicy, ToolLocator,
+    Trasher,
 };
 
 const SETTINGS_FILE: &str = "settings.json";
@@ -26,6 +27,8 @@ const BYTES_PER_MB: u64 = 1_000_000;
 const FORBIDDEN_FOLDERS: [&str; 4] = ["/System", "/usr", "/bin", "/sbin"];
 const MAX_LIST_LEN: usize = 256;
 const MAX_ENTRY_LEN: usize = 1024;
+/// File name of the privileged helper next to the app executable.
+const HELPER_NAME: &str = "sweeper-helper";
 
 /// User preferences, stored as JSON in the data directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +83,12 @@ pub struct AppContext {
     pub orphan_rules: OrphanRules,
     /// The normal policy plus the roots the cleaner rules need (`~/.npm`, ...).
     pub cleaner_policy: PathPolicy,
+    /// Policy for system-scope items (`/Library`, `/Applications`), applied
+    /// before anything is handed to the privileged helper.
+    pub system_policy: SystemPolicy,
+    /// The bundled `sweeper-helper`, when it exists as a regular file.
+    /// Without it administrator operations are disabled.
+    pub helper: Option<PathBuf>,
     pub log: ActionLog,
     /// Last list produced by `list_apps`; used when scanning and uninstalling.
     pub installed: Mutex<Vec<AppInfo>>,
@@ -114,6 +123,8 @@ impl AppContext {
             log: ActionLog::new(&env),
             policy: PathPolicy::new(&env, &[]),
             cleaner_policy: PathPolicy::new(&env, &[]),
+            system_policy: SystemPolicy::new(&env, &[]),
+            helper: None,
             clean_rules,
             tools: Box::new(RealToolLocator),
             orphan_rules,
@@ -143,8 +154,17 @@ impl AppContext {
         self
     }
 
+    /// Uses `helper` as the privileged helper (tests).
+    pub fn with_helper(mut self, helper: Option<PathBuf>) -> AppContext {
+        self.helper = helper;
+        self
+    }
+
     /// The context used by the running application.
     pub fn production() -> AppContext {
+        let helper = std::env::current_exe()
+            .ok()
+            .and_then(|exe| resolve_helper(&exe));
         AppContext::new(
             Env::current(),
             RuleSet::bundled(),
@@ -153,6 +173,7 @@ impl AppContext {
             Box::new(RealProcesses),
             Box::new(RealTrasher),
         )
+        .with_helper(helper)
     }
 
     /// Makes `settings` effective: app folders and the protected list.
@@ -165,6 +186,7 @@ impl AppContext {
         }
         self.env.app_dirs = dirs;
         self.policy = PathPolicy::new(&self.env, &settings.protected);
+        self.system_policy = SystemPolicy::new(&self.env, &settings.protected);
         self.cleaner_policy = PathPolicy::new(&self.env, &settings.protected)
             .with_extra_roots(&cleaner_roots(&self.env, &self.clean_rules));
         self.settings = settings;
@@ -178,6 +200,14 @@ impl AppContext {
     pub fn installed_apps(&self) -> Vec<AppInfo> {
         lock(&self.installed).clone()
     }
+}
+
+/// The helper that ships next to the executable (`Contents/MacOS` in the app
+/// bundle). It must be a regular file: a symlink or folder is not trusted.
+pub fn resolve_helper(exe: &Path) -> Option<PathBuf> {
+    let helper = exe.parent()?.join(HELPER_NAME);
+    let meta = fs::symlink_metadata(&helper).ok()?;
+    meta.file_type().is_file().then_some(helper)
 }
 
 pub fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {

@@ -51,6 +51,8 @@ pub fn run() {
             cmd::running_instances,
             cmd::quit_apps,
             cmd::uninstall,
+            cmd::receipts,
+            cmd::admin_available,
             cmd::brew_zap_command,
             cmd::brew_zap,
             cmd::fda_status,

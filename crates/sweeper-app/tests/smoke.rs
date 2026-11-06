@@ -109,7 +109,8 @@ fn uninstall_flow_end_to_end() {
 
     // Uninstall reports progress and leaves nothing behind.
     let mut progress = Vec::new();
-    let report = commands::uninstall(ctx, &scan, &mut |p| progress.push(p)).expect("uninstall");
+    let report =
+        commands::uninstall(ctx, &scan, &[], &mut |p| progress.push(p)).expect("uninstall");
     assert_eq!(progress.len(), plan.items.len());
     assert!(
         report.removal.failed.is_empty(),
@@ -143,7 +144,7 @@ fn delete_immediately_bypasses_the_trash() {
     commands::save_settings(&mut h.ctx, &settings).expect("save");
     commands::list_apps(&h.ctx);
     let scan = commands::scan_app(&h.ctx, &h.app, &AtomicBool::new(false)).expect("scan");
-    let report = commands::uninstall(&h.ctx, &scan, &mut |_| {}).expect("uninstall");
+    let report = commands::uninstall(&h.ctx, &scan, &[], &mut |_| {}).expect("uninstall");
     assert!(report.remaining.is_empty());
     assert!(!h.fx.trash_dir.join("Foo.app").exists());
     assert!(commands::undo_entries(&h.ctx).expect("undo").is_empty());
@@ -156,7 +157,7 @@ fn apple_apps_cannot_be_uninstalled() {
     commands::list_apps(&h.ctx);
     let scan = commands::scan_app(&h.ctx, &apple, &AtomicBool::new(false)).expect("scan");
     assert!(commands::plan_removal(&scan).items.is_empty());
-    assert!(commands::uninstall(&h.ctx, &scan, &mut |_| {}).is_err());
+    assert!(commands::uninstall(&h.ctx, &scan, &[], &mut |_| {}).is_err());
     assert!(apple.exists());
 }
 
