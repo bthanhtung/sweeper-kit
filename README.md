@@ -16,8 +16,61 @@ A free, open-source (MIT), fully offline app uninstaller for macOS. Pick an app,
 
 - It never touches Apple apps (they are read-only) or anything inside the deny list below.
 - It has no network code: no telemetry, no update checks, no accounts.
-- It does not clean caches system-wide, find orphaned leftovers of already-deleted apps, restore from the Trash, or work with administrator rights. Those are planned (see the milestones).
+- It does not clean system-wide caches (only your own `~/Library` and home folder), find orphaned leftovers of already-deleted apps, restore from the Trash, or work with administrator rights. Those are planned (see the milestones).
 - It does not manage the login items of other apps beyond the System Events attempt described in [Limitations](#limitations).
+
+## Cache & Junk Cleaner
+
+The **Cleaner** section (⌘R starts a scan) lists files that apps and tools regenerate. Nothing is selected for removal except safe caches; you review a dry run before anything happens. Categories:
+
+| Category | What it lists |
+| --- | --- |
+| App caches | Each folder in `~/Library/Caches` (browser, Homebrew and tool caches have their own entries) |
+| Logs | App logs in `~/Library/Logs` and crash reports (Sweeper Kit's own log is excluded) |
+| Browser caches | Cache, Code Cache, GPUCache and Service Worker cache folders of Safari, Chrome, Edge, Brave, Arc and Firefox |
+| Developer | Xcode DerivedData, Archives and DeviceSupport, simulator caches, npm, Yarn, pnpm, Cargo, pip, Gradle, CocoaPods and Go build caches, Homebrew downloads, plus the actions below |
+| Trash | Every item in `~/.Trash` (never selected by default) |
+| Old downloads | Items in `~/Downloads` not modified for N days (default 30, change it in Settings; never selected by default) |
+
+**Never touched:** browser history, cookies, saved passwords, bookmarks, autofill and profile preferences; Documents, Desktop, Mail, Keychains and anything else outside the cache locations above. Rules cannot target those names and the path policy refuses them again before every removal.
+
+- **Trash is permanent.** Everything else is moved to the Trash and can be put back. Items you clean from the *Trash* category are deleted for good; the dry run lists them in a red section ("These items cannot be restored") and asks for a second confirmation ("Empty Trash permanently?"). The "Delete immediately" setting does not apply to the Cleaner: its items always go to the Trash.
+- **Actions** run a fixed command instead of deleting files, and the sheet shows the exact command line: `xcrun simctl delete unavailable`, `brew cleanup -s` and `docker system prune -f`. Tools are looked up at fixed system locations (never through `PATH`) and an action only appears when its tool is installed. Docker is never selected by default and needs its own confirmation: "Run docker system prune -f? This removes stopped containers, unused networks, dangling images and build cache." Stopped containers and unused networks are lost; volumes are kept.
+- **Running-app guard.** If the app a cache belongs to is running (for example Chrome), its entries come back unchecked with a warning, because a running app may be using them. Quit the app, scan again, or tick them deliberately.
+- **Minimum item size.** Settings › Cleaner hides entries below a size you choose; actions are always listed.
+- **Only ids cross the UI boundary.** The UI sends the ids of the entries you ticked; the app rebuilds the plan from its own scan, rejects unknown ids and ignores refused entries.
+
+### Custom cleaner rules
+
+What the cleaner lists is data: `rules/macos-cleaner.json`. Your own rules go in `~/Library/Application Support/Sweeper Kit/cleaner-rules.json` and are merged over the bundled ones at startup (a category or item with an existing `id` replaces the bundled one, a new `id` is added). An invalid file is ignored and the reason is shown in the Cleaner.
+
+```json
+{
+  "version": 1,
+  "categories": [
+    {
+      "id": "developer",
+      "title": "Developer",
+      "items": [
+        {
+          "id": "bun",
+          "title": "Bun cache",
+          "paths": ["~/.bun/install/cache"],
+          "default_checked": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+- Category: `id`, `title`, `items`. Item: `id` and `title` (no `/`), then either `paths` or `action`.
+- `paths`: patterns starting with `~/`, plain segments and `*` inside a segment (no `..`, no `**`). `each_child` lists the children of the folder instead of the folder itself; `exclude_children` names children to skip.
+- `app_bundle_id`: if that app is running, the item is unchecked with a warning.
+- `default_checked`: selected after a scan. `min_age_days`: only items not modified for that long (the Settings value is used for Downloads).
+- `mode`: `trash` (default) or `delete_only`, which is only accepted for paths inside `~/.Trash`.
+- Rules whose last path segment is personal browser data (History, Cookies, Login Data, Web Data, Bookmarks, Favicons, `places.sqlite`, `key4.db`, `logins.json`, Preferences, Local State, ...) are rejected, and locations must lie inside your home folder and outside protected areas.
+- `action` is chosen **by id only**: `simctl_delete_unavailable`, `brew_cleanup` or `docker_prune`. Rules cannot supply commands or arguments.
 
 ## Safety model
 
@@ -100,7 +153,8 @@ Your own rules go in `~/Library/Application Support/Sweeper Kit/rules.json`, in 
 | Milestone | Status |
 | --- | --- |
 | M1: Uninstaller (core library, app, UI, smoke tests) | Done |
-| M2–M4: leftovers of already-deleted apps, cache cleaner, restore UI for the undo log | Planned |
+| M2: Cache & Junk Cleaner (rules, core, UI, smoke tests) | Done |
+| M3–M4: leftovers of already-deleted apps, restore UI for the undo log | Planned |
 
 ## License
 
