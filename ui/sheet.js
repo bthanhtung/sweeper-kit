@@ -111,9 +111,8 @@ async function run(scan, plan, onDone) {
   });
   try {
     const report = await invoke('uninstall', { scan });
-    const undo = state.settings.delete_immediately ? [] : await invoke('undo_entries');
     busy = false;
-    reportSheet(scan, report, undo.length, onDone);
+    reportSheet(scan, report, onDone);
   } catch (e) {
     close();
     showError(String(e));
@@ -131,7 +130,7 @@ export function stepRow(ok, text) {
   );
 }
 
-function reportSheet(scan, report, undoCount, onDone) {
+function reportSheet(scan, report, onDone) {
   const { removed, failed, warnings } = report.removal;
   const size = removed.reduce((sum, r) => sum + r.size, 0);
   const trashed = removed.some((r) => r.trash_location);
@@ -166,7 +165,19 @@ function reportSheet(scan, report, undoCount, onDone) {
         h(
           'p',
           { class: 'dim' },
-          `Items are in the Trash — restorable (${plural(undoCount, 'item')} in the undo list).`,
+          'Items are in the Trash. ',
+          h(
+            'button',
+            {
+              type: 'button',
+              class: 'btn link',
+              onclick: () => {
+                done();
+                document.dispatchEvent(new CustomEvent('show-view', { detail: 'history' }));
+              },
+            },
+            'View in History',
+          ),
         ),
     ),
     foot(button('Done', { kind: 'primary', onclick: done, autofocus: true })),

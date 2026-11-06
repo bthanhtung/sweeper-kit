@@ -29,6 +29,26 @@ export const state = {
     token: 0,
     warning: null,
   },
+  /** Leftovers view: the last scan and what is ticked/expanded. */
+  leftovers: {
+    scan: null,
+    /** Item paths to remove; the server only accepts paths from its own scan. */
+    selected: new Set(),
+    /** Group keys whose item list is open. */
+    expanded: new Set(),
+    scanning: false,
+    token: 0,
+    warning: null,
+  },
+  /** History view: Trash batches, newest first. */
+  history: {
+    batches: [],
+    loaded: false,
+    /** Entry ids ticked for restore. */
+    selected: new Set(),
+    expanded: new Set(),
+    token: 0,
+  },
 };
 
 export const sizeOf = (app) => state.sizes.get(app.path) ?? app.size;

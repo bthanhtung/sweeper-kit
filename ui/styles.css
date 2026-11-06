@@ -375,6 +375,14 @@ svg.nav-glyph { display: block; }
 .clean-list { margin: 0; padding: 0; list-style: none; }
 .badge.danger { background: var(--danger-bg); color: var(--danger); margin-right: 6px; }
 .item .badge { margin-top: 2px; }
+.badge.conf-high { background: rgba(36, 138, 61, 0.16); color: var(--ok); }
+.badge.conf-medium { background: var(--warning-bg); color: var(--warning); }
+.badge.conf-low { background: var(--bg-hover); color: var(--text-2); }
+.group-head .badge { white-space: nowrap; }
+.disclosure .key { font-weight: 400; font: 11px var(--mono); overflow-wrap: anywhere; }
+.item .reason.refusal { color: var(--warning); }
+.item.gone .name, .item.gone .path { color: var(--text-2); }
+.view-note { margin: 0; padding: 0 24px 4px; }
 .item .path.command { display: block; }
 .sheet-section { margin: 12px 0 2px; font-size: 13px; }
 .sheet-body p.warn, .sheet-section.warn { color: var(--danger); }

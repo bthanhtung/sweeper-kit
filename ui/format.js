@@ -22,6 +22,13 @@ export function formatDate(secs) {
   return secs == null ? 'Never opened' : dateFormat.format(new Date(secs * 1000));
 }
 
+const dateTimeFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+
+/** `secs` is a Unix timestamp. */
+export function formatDateTime(secs) {
+  return dateTimeFormat.format(new Date(secs * 1000));
+}
+
 export function basename(path) {
   const trimmed = path.replace(/\/+$/, '');
   return trimmed.slice(trimmed.lastIndexOf('/') + 1) || trimmed;

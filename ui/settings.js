@@ -1,7 +1,8 @@
 // Settings view: extra app folders, protected list, deletion mode.
 
-import { $, h, clear, showError } from './dom.js';
+import { $, h, clear, showError, announce } from './dom.js';
 import { invoke, pickFolder } from './api.js';
+import { formatDate } from './format.js';
 import { state } from './state.js';
 
 let onFoldersChanged = () => {};
@@ -18,6 +19,16 @@ async function save(next) {
     const foldersBefore = state.settings.extra_app_folders.join('\n');
     state.settings = await invoke('save_settings', { settings: next });
     if (foldersBefore !== state.settings.extra_app_folders.join('\n')) onFoldersChanged();
+  } catch (e) {
+    showError(String(e));
+  }
+  await renderSettings();
+}
+
+async function forgetRemovedApp(app) {
+  try {
+    await invoke('forget_removed_app', { bundleId: app.bundle_id });
+    announce(`${app.name} forgotten.`);
   } catch (e) {
     showError(String(e));
   }
@@ -82,6 +93,10 @@ export async function renderSettings() {
   const view = $('#view-settings');
   const s = state.settings;
   const warning = await invoke('rules_warning');
+  const removedApps = await invoke('removed_apps').catch((e) => {
+    showError(String(e));
+    return [];
+  });
   const entry = h('input', {
     type: 'text',
     id: 'protect-input',
@@ -159,6 +174,39 @@ export async function renderSettings() {
           max: AGE_RANGE[1],
           store: (value) => save({ ...s, downloads_age_days: value }),
         }),
+      ),
+
+      h(
+        'section',
+        {},
+        h('h3', {}, 'Removed apps history'),
+        h(
+          'p',
+          {},
+          'Apps you uninstalled with Sweeper Kit. Their leftovers are listed as high confidence. Forgetting an app lowers the confidence of its future leftovers.',
+        ),
+        h(
+          'ul',
+          { 'aria-label': 'Removed apps' },
+          removedApps.length === 0
+            ? h('li', {}, h('span', { class: 'dim' }, 'None'))
+            : [...removedApps].reverse().map((app) =>
+                h(
+                  'li',
+                  {},
+                  h('span', {}, `${app.name} (${app.bundle_id}) — ${formatDate(app.removed_at)}`),
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      class: 'btn',
+                      'aria-label': `Forget ${app.name}`,
+                      onclick: () => forgetRemovedApp(app),
+                    },
+                    'Forget',
+                  ),
+                )),
+        ),
       ),
 
       h(

@@ -7,6 +7,8 @@ import {
   initDetail, renderDetail, showLoading, showPlaceholder,
 } from './detail.js';
 import { render as renderCleaner, startScan } from './cleaner.js';
+import { render as renderLeftovers, startScan as startLeftoversScan } from './leftovers.js';
+import { render as renderHistory, loadHistory } from './history.js';
 import { initSettings, renderSettings } from './settings.js';
 import { startBrewZap, startUninstall } from './sheet.js';
 import { state } from './state.js';
@@ -80,14 +82,21 @@ function openDropped(path) {
   scanApp(path);
 }
 
+const VIEWS = ['uninstaller', 'leftovers', 'cleaner', 'history', 'settings'];
+
 function showView(name) {
-  for (const view of ['uninstaller', 'cleaner', 'settings']) {
+  for (const view of VIEWS) {
     $(`#view-${view}`).hidden = view !== name;
     const nav = $(`#nav-${view}`);
     if (view === name) nav.setAttribute('aria-current', 'page');
     else nav.removeAttribute('aria-current');
   }
   if (name === 'cleaner') renderCleaner();
+  if (name === 'leftovers') renderLeftovers();
+  if (name === 'history') {
+    renderHistory();
+    loadHistory();
+  }
   if (name === 'settings') renderSettings();
 }
 
@@ -106,7 +115,14 @@ function bindShortcuts() {
       showView('cleaner');
       startScan();
     }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'l') {
+      e.preventDefault();
+      if ($('#sheet').open) return;
+      showView('leftovers');
+      startLeftoversScan();
+    }
   });
+  document.addEventListener('show-view', (e) => showView(e.detail));
 }
 
 async function main() {
