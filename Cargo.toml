@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/sweeper-core", "crates/sweeper-app"]
+members = ["crates/sweeper-core", "crates/sweeper-app", "crates/sweeper-helper"]
 resolver = "2"
 
 [workspace.package]

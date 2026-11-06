@@ -3301,6 +3301,7 @@ dependencies = [
 name = "sweeper-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -3311,6 +3312,14 @@ dependencies = [
  "sweeper-core",
  "tempfile",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "sweeper-helper"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sweeper-core",
 ]
 
 [[package]]

@@ -1,0 +1,15 @@
+[package]
+name = "sweeper-helper"
+version = "0.1.0"
+description = "Privileged helper of Sweeper Kit: runs a validated manifest of system-scope operations as root"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sweeper-helper"
+path = "src/main.rs"
+
+[dependencies]
+sweeper-core = { path = "../sweeper-core" }
+serde_json.workspace = true
