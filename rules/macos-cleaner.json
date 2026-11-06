@@ -1,0 +1,247 @@
+{
+  "version": 1,
+  "categories": [
+    {
+      "id": "user_caches",
+      "title": "App caches",
+      "items": [
+        {
+          "id": "library_caches",
+          "title": "App caches",
+          "paths": ["~/Library/Caches"],
+          "each_child": true,
+          "exclude_children": ["Google", "Firefox", "Microsoft Edge", "BraveSoftware", "Arc", "com.apple.Safari", "Homebrew", "pip", "Yarn", "CocoaPods", "go-build", "com.apple.nsurlsessiond"],
+          "default_checked": true
+        }
+      ]
+    },
+    {
+      "id": "logs",
+      "title": "Logs",
+      "items": [
+        {
+          "id": "library_logs",
+          "title": "App logs",
+          "paths": ["~/Library/Logs"],
+          "each_child": true,
+          "exclude_children": ["Sweeper Kit", "DiagnosticReports"],
+          "default_checked": true
+        },
+        {
+          "id": "diagnostic_reports",
+          "title": "Crash reports",
+          "paths": ["~/Library/Logs/DiagnosticReports"],
+          "default_checked": true
+        }
+      ]
+    },
+    {
+      "id": "browser_caches",
+      "title": "Browser caches",
+      "items": [
+        {
+          "id": "safari",
+          "title": "Safari",
+          "app_bundle_id": "com.apple.Safari",
+          "paths": ["~/Library/Caches/com.apple.Safari"],
+          "default_checked": true
+        },
+        {
+          "id": "chrome",
+          "title": "Google Chrome",
+          "app_bundle_id": "com.google.Chrome",
+          "paths": [
+            "~/Library/Caches/Google/Chrome/*/Cache",
+            "~/Library/Caches/Google/Chrome/*/Code Cache",
+            "~/Library/Application Support/Google/Chrome/*/Cache",
+            "~/Library/Application Support/Google/Chrome/*/Code Cache",
+            "~/Library/Application Support/Google/Chrome/*/GPUCache",
+            "~/Library/Application Support/Google/Chrome/*/Service Worker/CacheStorage"
+          ],
+          "default_checked": true
+        },
+        {
+          "id": "edge",
+          "title": "Microsoft Edge",
+          "app_bundle_id": "com.microsoft.edgemac",
+          "paths": [
+            "~/Library/Caches/Microsoft Edge/*/Cache",
+            "~/Library/Caches/Microsoft Edge/*/Code Cache",
+            "~/Library/Application Support/Microsoft Edge/*/Cache",
+            "~/Library/Application Support/Microsoft Edge/*/Code Cache",
+            "~/Library/Application Support/Microsoft Edge/*/GPUCache",
+            "~/Library/Application Support/Microsoft Edge/*/Service Worker/CacheStorage"
+          ],
+          "default_checked": true
+        },
+        {
+          "id": "brave",
+          "title": "Brave",
+          "app_bundle_id": "com.brave.Browser",
+          "paths": [
+            "~/Library/Caches/BraveSoftware/Brave-Browser/*/Cache",
+            "~/Library/Caches/BraveSoftware/Brave-Browser/*/Code Cache",
+            "~/Library/Application Support/BraveSoftware/Brave-Browser/*/Cache",
+            "~/Library/Application Support/BraveSoftware/Brave-Browser/*/Code Cache",
+            "~/Library/Application Support/BraveSoftware/Brave-Browser/*/GPUCache",
+            "~/Library/Application Support/BraveSoftware/Brave-Browser/*/Service Worker/CacheStorage"
+          ],
+          "default_checked": true
+        },
+        {
+          "id": "arc",
+          "title": "Arc",
+          "app_bundle_id": "company.thebrowser.Browser",
+          "paths": [
+            "~/Library/Caches/Arc",
+            "~/Library/Application Support/Arc/User Data/*/Cache",
+            "~/Library/Application Support/Arc/User Data/*/Code Cache",
+            "~/Library/Application Support/Arc/User Data/*/GPUCache",
+            "~/Library/Application Support/Arc/User Data/*/Service Worker/CacheStorage"
+          ],
+          "default_checked": true
+        },
+        {
+          "id": "firefox",
+          "title": "Firefox",
+          "app_bundle_id": "org.mozilla.firefox",
+          "paths": ["~/Library/Caches/Firefox/Profiles/*/cache2"],
+          "default_checked": true
+        }
+      ]
+    },
+    {
+      "id": "developer",
+      "title": "Developer",
+      "items": [
+        {
+          "id": "xcode_derived_data",
+          "title": "Xcode DerivedData",
+          "app_bundle_id": "com.apple.dt.Xcode",
+          "paths": ["~/Library/Developer/Xcode/DerivedData/*"],
+          "default_checked": true
+        },
+        {
+          "id": "xcode_archives",
+          "title": "Xcode Archives",
+          "app_bundle_id": "com.apple.dt.Xcode",
+          "paths": ["~/Library/Developer/Xcode/Archives/*"],
+          "default_checked": false
+        },
+        {
+          "id": "ios_device_support",
+          "title": "iOS DeviceSupport",
+          "app_bundle_id": "com.apple.dt.Xcode",
+          "paths": ["~/Library/Developer/Xcode/iOS DeviceSupport/*"],
+          "default_checked": false
+        },
+        {
+          "id": "coresimulator_caches",
+          "title": "Simulator caches",
+          "paths": ["~/Library/Developer/CoreSimulator/Caches"],
+          "default_checked": true
+        },
+        {
+          "id": "simulators_unavailable",
+          "title": "Unavailable simulators",
+          "action": "simctl_delete_unavailable",
+          "default_checked": true
+        },
+        {
+          "id": "npm",
+          "title": "npm cache",
+          "paths": ["~/.npm/_cacache"],
+          "default_checked": true
+        },
+        {
+          "id": "yarn",
+          "title": "Yarn cache",
+          "paths": ["~/Library/Caches/Yarn"],
+          "default_checked": true
+        },
+        {
+          "id": "pnpm",
+          "title": "pnpm store",
+          "paths": ["~/Library/pnpm/store"],
+          "default_checked": true
+        },
+        {
+          "id": "cargo",
+          "title": "Cargo registry cache",
+          "paths": ["~/.cargo/registry/cache"],
+          "default_checked": true
+        },
+        {
+          "id": "homebrew_downloads",
+          "title": "Homebrew downloads",
+          "paths": ["~/Library/Caches/Homebrew"],
+          "default_checked": true
+        },
+        {
+          "id": "homebrew_cleanup",
+          "title": "Homebrew cleanup",
+          "action": "brew_cleanup",
+          "default_checked": false
+        },
+        {
+          "id": "pip",
+          "title": "pip cache",
+          "paths": ["~/Library/Caches/pip"],
+          "default_checked": true
+        },
+        {
+          "id": "gradle",
+          "title": "Gradle caches",
+          "paths": ["~/.gradle/caches"],
+          "default_checked": true
+        },
+        {
+          "id": "cocoapods",
+          "title": "CocoaPods cache",
+          "paths": ["~/Library/Caches/CocoaPods"],
+          "default_checked": true
+        },
+        {
+          "id": "go_build",
+          "title": "Go build cache",
+          "paths": ["~/Library/Caches/go-build"],
+          "default_checked": true
+        },
+        {
+          "id": "docker",
+          "title": "Docker unused data",
+          "action": "docker_prune",
+          "default_checked": false
+        }
+      ]
+    },
+    {
+      "id": "trash",
+      "title": "Trash",
+      "items": [
+        {
+          "id": "trash",
+          "title": "Trash",
+          "paths": ["~/.Trash"],
+          "each_child": true,
+          "mode": "delete_only",
+          "default_checked": false
+        }
+      ]
+    },
+    {
+      "id": "old_downloads",
+      "title": "Old downloads",
+      "items": [
+        {
+          "id": "downloads",
+          "title": "Downloads",
+          "paths": ["~/Downloads"],
+          "each_child": true,
+          "min_age_days": 30,
+          "default_checked": false
+        }
+      ]
+    }
+  ]
+}

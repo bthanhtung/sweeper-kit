@@ -10,6 +10,7 @@ use std::time::SystemTime;
 
 use tempfile::TempDir;
 
+use crate::cleaner::{Tool, ToolLocator};
 use crate::env::{Env, SELF_BUNDLE_ID};
 use crate::system::{CommandOutput, CommandRunner, Processes, RunningApp, Spotlight, Trasher};
 
@@ -210,6 +211,30 @@ impl Processes for FakeProcesses {
     fn force_terminate(&self, pid: i32) -> bool {
         lock(&self.forced).push(pid);
         self.remove(pid)
+    }
+}
+
+/// Tool locations from a table; unlisted tools are "not installed".
+#[derive(Default)]
+pub struct FakeToolLocator {
+    tools: HashMap<Tool, PathBuf>,
+}
+
+impl FakeToolLocator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pretends `tool` is installed at `path`.
+    pub fn with(mut self, tool: Tool, path: &str) -> Self {
+        self.tools.insert(tool, PathBuf::from(path));
+        self
+    }
+}
+
+impl ToolLocator for FakeToolLocator {
+    fn find(&self, tool: Tool) -> Option<PathBuf> {
+        self.tools.get(&tool).cloned()
     }
 }
 

@@ -5,6 +5,7 @@
 //! evaluated again immediately before each removal.
 
 pub mod catalog;
+pub mod cleaner;
 pub mod env;
 mod fsutil;
 pub mod log;
@@ -21,6 +22,11 @@ pub mod uninstall;
 pub mod testing;
 
 pub use catalog::{compute_sizes, team_id, AppCatalog, AppInfo, AppSource};
+pub use cleaner::{
+    cleaner_roots, CacheScanner, CleanAction, CleanCategory, CleanCategoryRule, CleanEntry,
+    CleanItemRule, CleanMode, CleanOptions, CleanPlan, CleanReport, CleanRules, CleanRulesError,
+    CleanScan, Cleaner, RealToolLocator, Tool, ToolLocator,
+};
 pub use env::{Env, SELF_BUNDLE_ID};
 pub use log::ActionLog;
 pub use path_policy::{PathPolicy, PolicyError};
