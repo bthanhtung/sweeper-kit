@@ -64,6 +64,15 @@ pub fn run() {
             cmd::scan_cleaner,
             cmd::plan_clean,
             cmd::clean,
+            cmd::orphan_rules_warning,
+            cmd::scan_leftovers,
+            cmd::plan_leftovers,
+            cmd::remove_leftovers,
+            cmd::history,
+            cmd::restore,
+            cmd::forget_history,
+            cmd::removed_apps,
+            cmd::forget_removed_app,
             cmd::take_pending_open,
         ])
         .build(tauri::generate_context!())

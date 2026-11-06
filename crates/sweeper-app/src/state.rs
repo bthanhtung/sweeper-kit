@@ -9,13 +9,14 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use serde::{Deserialize, Serialize};
 use sweeper_core::{
     cleaner_roots, is_valid_bundle_id, ActionLog, AppInfo, CleanOptions, CleanRules, CleanScan,
-    CommandRunner, Env, PathPolicy, Processes, RealProcesses, RealRunner, RealSpotlight,
-    RealToolLocator, RealTrasher, RuleSet, Spotlight, ToolLocator, Trasher,
+    CommandRunner, Env, OrphanRules, OrphanScan, PathPolicy, Processes, RealProcesses, RealRunner,
+    RealSpotlight, RealToolLocator, RealTrasher, RuleSet, Spotlight, ToolLocator, Trasher,
 };
 
 const SETTINGS_FILE: &str = "settings.json";
 const USER_RULES_FILE: &str = "rules.json";
 const USER_CLEAN_RULES_FILE: &str = "cleaner-rules.json";
+const USER_ORPHAN_RULES_FILE: &str = "orphan-rules.json";
 /// Valid range of [`Settings::downloads_age_days`] (ten years at most).
 pub const DOWNLOADS_AGE_RANGE: std::ops::RangeInclusive<u32> = 1..=3650;
 /// Largest accepted [`Settings::min_item_size_mb`] (1 TB).
@@ -75,6 +76,8 @@ pub struct AppContext {
     /// Bundled cleaner rules merged with the user's `cleaner-rules.json`.
     pub clean_rules: CleanRules,
     pub tools: Box<dyn ToolLocator>,
+    /// Bundled orphan rules merged with the user's `orphan-rules.json`.
+    pub orphan_rules: OrphanRules,
     /// The normal policy plus the roots the cleaner rules need (`~/.npm`, ...).
     pub cleaner_policy: PathPolicy,
     pub log: ActionLog,
@@ -84,6 +87,8 @@ pub struct AppContext {
     pub rules_warning: Option<String>,
     /// Why the user cleaner rules file was ignored, if it was.
     pub clean_rules_warning: Option<String>,
+    /// Why the user orphan rules file was ignored, if it was.
+    pub orphan_rules_warning: Option<String>,
     default_app_dirs: Vec<PathBuf>,
 }
 
@@ -104,12 +109,14 @@ impl AppContext {
         settings.extra_app_folders.retain(|p| p.is_dir());
         let (rules, rules_warning) = load_rules(&env, rules);
         let (clean_rules, clean_rules_warning) = load_clean_rules(&env);
+        let (orphan_rules, orphan_rules_warning) = load_orphan_rules(&env);
         let mut ctx = AppContext {
             log: ActionLog::new(&env),
             policy: PathPolicy::new(&env, &[]),
             cleaner_policy: PathPolicy::new(&env, &[]),
             clean_rules,
             tools: Box::new(RealToolLocator),
+            orphan_rules,
             env,
             rules,
             settings: Settings::default(),
@@ -120,6 +127,7 @@ impl AppContext {
             installed: Mutex::new(Vec::new()),
             rules_warning,
             clean_rules_warning,
+            orphan_rules_warning,
             default_app_dirs,
         };
         ctx.apply_settings(settings);
@@ -201,6 +209,18 @@ fn load_clean_rules(env: &Env) -> (CleanRules, Option<String>) {
         return (base, None);
     }
     match CleanRules::load(&path) {
+        Ok(user) => (base.merge(user), None),
+        Err(e) => (base, Some(format!("Ignored {}: {e}", path.display()))),
+    }
+}
+
+fn load_orphan_rules(env: &Env) -> (OrphanRules, Option<String>) {
+    let base = OrphanRules::bundled();
+    let path = env.data_dir.join(USER_ORPHAN_RULES_FILE);
+    if !path.exists() {
+        return (base, None);
+    }
+    match OrphanRules::load(&path) {
         Ok(user) => (base.merge(user), None),
         Err(e) => (base, Some(format!("Ignored {}: {e}", path.display()))),
     }
@@ -333,6 +353,9 @@ pub struct AppState {
     pub clean_cancel: CancelSlot,
     /// Last cleaner scan; plans are always rebuilt from it, never from the UI.
     pub clean_scan: Mutex<Option<CleanScan>>,
+    pub leftovers_cancel: CancelSlot,
+    /// Last leftover scan; plans are always rebuilt from it, never from the UI.
+    pub leftover_scan: Mutex<Option<OrphanScan>>,
     /// An app opened before the UI was ready to listen for `open-app`.
     pub pending_open: Mutex<Option<PathBuf>>,
 }
@@ -345,6 +368,8 @@ impl AppState {
             sizes_cancel: CancelSlot::default(),
             clean_cancel: CancelSlot::default(),
             clean_scan: Mutex::new(None),
+            leftovers_cancel: CancelSlot::default(),
+            leftover_scan: Mutex::new(None),
             pending_open: Mutex::new(None),
         }
     }

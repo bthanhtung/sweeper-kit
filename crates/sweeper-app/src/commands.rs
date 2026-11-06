@@ -12,8 +12,9 @@ use serde::Serialize;
 use sweeper_core::{
     apply_preset as core_apply_preset, brew_zap_command as core_brew_zap_command, compute_sizes,
     full_disk_access, team_id, AppCatalog, AppInfo, CacheScanner, CleanPlan, CleanReport,
-    CleanScan, Cleaner, FdaStatus, LeftoverScanner, Preset, Progress, QuitOutcome, RemovalMode,
-    RemovalPlan, Remover, RunningApp, ScanResult, StepResult, UndoEntry, UndoLog, UninstallReport,
+    CleanScan, Cleaner, FdaStatus, LeftoverScanner, OrphanFinder, OrphanScan, Preset, Progress,
+    QuitOutcome, RemovalMode, RemovalPlan, RemovalReport, RemovedApp, RemovedApps, Remover,
+    RunningApp, ScanResult, StepResult, UndoBatch, UndoEntry, UndoLog, UninstallReport,
     Uninstaller,
 };
 
@@ -25,6 +26,8 @@ pub const CANCELLED: &str = "cancelled";
 pub const QUIT_GRACE: Duration = Duration::from_secs(5);
 /// Error when the cleaner has no scan to work from.
 const NO_SCAN: &str = "Scan first.";
+/// Error when the selection contains nothing that can be removed.
+const NOTHING_SELECTED: &str = "Nothing selected that can be removed. Scan again.";
 /// Apps sized per batch, so sizes reach the UI progressively.
 const SIZE_BATCH: usize = 8;
 
@@ -33,6 +36,15 @@ const SIZE_BATCH: usize = 8;
 pub struct SizeUpdate {
     pub path: PathBuf,
     pub size: u64,
+}
+
+/// Result of restoring one history entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RestoreOutcome {
+    pub id: String,
+    pub ok: bool,
+    /// The restored path on success, the reason on failure.
+    pub path_or_error: String,
 }
 
 // ---- plain functions -------------------------------------------------------
@@ -296,6 +308,127 @@ pub fn clean(
     Ok(cleaner.execute(&plan, progress))
 }
 
+// ---- leftovers -------------------------------------------------------------
+
+/// Finds data of apps that are no longer installed. Returns [`CANCELLED`]
+/// when superseded.
+pub fn scan_leftovers(ctx: &AppContext, cancel: &AtomicBool) -> Result<OrphanScan, String> {
+    let history = RemovedApps::for_env(&ctx.env);
+    let finder = OrphanFinder::new(
+        &ctx.env,
+        &ctx.orphan_rules,
+        &ctx.policy,
+        &*ctx.spotlight,
+        &*ctx.processes,
+        &history,
+    );
+    let scan = finder.scan(&ctx.installed_apps(), cancel);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CANCELLED.into());
+    }
+    Ok(scan)
+}
+
+/// Dry run: exactly what removing the `selected` paths would do. Paths that
+/// are not in `scan` or were refused are ignored.
+pub fn plan_leftovers(scan: &OrphanScan, selected: &[PathBuf]) -> Result<RemovalPlan, String> {
+    let plan = scan.plan(Some(selected));
+    if plan.items.is_empty() {
+        return Err(NOTHING_SELECTED.into());
+    }
+    Ok(plan)
+}
+
+/// Removes the `selected` paths of `scan` (Trash unless the setting says otherwise).
+pub fn remove_leftovers(
+    ctx: &AppContext,
+    scan: &OrphanScan,
+    selected: &[PathBuf],
+    progress: &mut dyn FnMut(Progress),
+) -> Result<RemovalReport, String> {
+    let plan = plan_leftovers(scan, selected)?;
+    let mode = if ctx.settings.delete_immediately {
+        RemovalMode::Delete
+    } else {
+        RemovalMode::Trash
+    };
+    ctx.log.record("remove-leftovers", &ctx.env.home);
+    let remover = Remover::new(
+        &ctx.env,
+        &ctx.policy,
+        &*ctx.trasher,
+        UndoLog::for_env(&ctx.env),
+    );
+    Ok(remover.execute(&plan, mode, progress))
+}
+
+// ---- history ---------------------------------------------------------------
+
+/// Trash moves grouped by run, newest first.
+pub fn history(ctx: &AppContext) -> Result<Vec<UndoBatch>, String> {
+    UndoLog::for_env(&ctx.env)
+        .batches()
+        .map_err(|e| format!("Could not read the history: {e}"))
+}
+
+/// Moves the entries `ids` back to where they came from.
+pub fn restore(ctx: &AppContext, ids: &[String]) -> Vec<RestoreOutcome> {
+    let log = UndoLog::for_env(&ctx.env);
+    ctx.log.record("restore", log.path());
+    log.restore_many(ids, &ctx.policy)
+        .into_iter()
+        .map(|(id, result)| match result {
+            Ok(path) => RestoreOutcome {
+                id,
+                ok: true,
+                path_or_error: path.display().to_string(),
+            },
+            Err(e) => RestoreOutcome {
+                id,
+                ok: false,
+                path_or_error: e.to_string(),
+            },
+        })
+        .collect()
+}
+
+/// Drops entries whose Trash item is gone. Entries still in the Trash are
+/// refused: forgetting them would remove the only way to restore them from
+/// the app. Returns how many entries were dropped.
+pub fn forget_history(ctx: &AppContext, ids: &[String]) -> Result<usize, String> {
+    let batches = history(ctx)?;
+    let statuses: Vec<_> = batches.iter().flat_map(|b| b.entries.iter()).collect();
+    for id in ids {
+        match statuses.iter().find(|s| s.entry.id == *id) {
+            None => return Err(format!("Unknown history entry: {id}")),
+            Some(s) if s.in_trash => {
+                return Err(format!(
+                    "{} is still in the Trash and cannot be removed from the history",
+                    s.entry.original.display()
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    let log = UndoLog::for_env(&ctx.env);
+    ctx.log.record("forget-history", log.path());
+    log.forget(ids)
+        .map_err(|e| format!("Could not update the history: {e}"))
+}
+
+/// Apps Sweeper Kit uninstalled, oldest first.
+pub fn removed_apps(ctx: &AppContext) -> Result<Vec<RemovedApp>, String> {
+    RemovedApps::for_env(&ctx.env)
+        .entries()
+        .map_err(|e| format!("Could not read the removed apps history: {e}"))
+}
+
+pub fn forget_removed_app(ctx: &AppContext, bundle_id: &str) -> Result<(), String> {
+    RemovedApps::for_env(&ctx.env)
+        .forget(bundle_id)
+        .map_err(|e| format!("Could not update the removed apps history: {e}"))
+}
+
 // ---- Tauri wrappers --------------------------------------------------------
 
 type Ctx = Arc<RwLock<AppContext>>;
@@ -503,6 +636,92 @@ pub mod wrappers {
             lock(&state.clean_scan).get_or_insert(scan);
         }
         result
+    }
+
+    #[tauri::command]
+    pub fn orphan_rules_warning(state: State<'_, AppState>) -> Option<String> {
+        read(&state.ctx).orphan_rules_warning.clone()
+    }
+
+    #[tauri::command]
+    pub async fn scan_leftovers(state: State<'_, AppState>) -> Result<OrphanScan, String> {
+        let ctx = state.ctx.clone();
+        let cancel = state.leftovers_cancel.renew();
+        let scan = blocking(move || super::scan_leftovers(&read(&ctx), &cancel)).await??;
+        *lock(&state.leftover_scan) = Some(scan.clone());
+        Ok(scan)
+    }
+
+    #[tauri::command]
+    pub fn plan_leftovers(
+        state: State<'_, AppState>,
+        selected: Vec<PathBuf>,
+    ) -> Result<RemovalPlan, String> {
+        let stored = lock(&state.leftover_scan);
+        let scan = stored.as_ref().ok_or(NO_SCAN)?;
+        super::plan_leftovers(scan, &selected)
+    }
+
+    #[tauri::command]
+    pub async fn remove_leftovers(
+        app: AppHandle,
+        state: State<'_, AppState>,
+        selected: Vec<PathBuf>,
+    ) -> Result<RemovalReport, String> {
+        // Taking the scan makes a second request fail instead of removing twice.
+        let scan = lock(&state.leftover_scan).take().ok_or(NO_SCAN)?;
+        let ctx = state.ctx.clone();
+        let for_work = scan.clone();
+        let result = blocking(move || {
+            super::remove_leftovers(&read(&ctx), &for_work, &selected, &mut |p| {
+                let _ = app.emit("leftovers-progress", p);
+            })
+        })
+        .await?;
+        if result.is_err() {
+            // Nothing ran (empty selection): keep the scan for a retry.
+            lock(&state.leftover_scan).get_or_insert(scan);
+        }
+        result
+    }
+
+    #[tauri::command]
+    pub async fn history(state: State<'_, AppState>) -> Result<Vec<UndoBatch>, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || super::history(&read(&ctx))).await?
+    }
+
+    #[tauri::command]
+    pub async fn restore(
+        state: State<'_, AppState>,
+        ids: Vec<String>,
+    ) -> Result<Vec<RestoreOutcome>, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || super::restore(&read(&ctx), &ids)).await
+    }
+
+    #[tauri::command]
+    pub async fn forget_history(
+        state: State<'_, AppState>,
+        ids: Vec<String>,
+    ) -> Result<usize, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || super::forget_history(&read(&ctx), &ids)).await?
+    }
+
+    #[tauri::command]
+    pub async fn removed_apps(state: State<'_, AppState>) -> Result<Vec<RemovedApp>, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || super::removed_apps(&read(&ctx))).await?
+    }
+
+    #[tauri::command]
+    pub async fn forget_removed_app(
+        state: State<'_, AppState>,
+        bundle_id: String,
+    ) -> Result<(), String> {
+        let ctx = state.ctx.clone();
+        blocking(move || super::forget_removed_app(&read(&ctx), &bundle_id)).await?
     }
 
     /// The app handed over before the UI started listening, if any.
