@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::AppInfo;
 use crate::env::Env;
+use crate::history::RemovedApps;
 use crate::path_policy::PathPolicy;
 use crate::remover::{Progress, RemovalMode, RemovalPlan, RemovalReport, Remover};
 use crate::scanner::{LeftoverScanner, ScanResult};
@@ -69,6 +70,7 @@ pub struct Uninstaller<'a> {
     remover: &'a Remover<'a>,
     scanner: &'a LeftoverScanner<'a>,
     installed: &'a [AppInfo],
+    history: RemovedApps,
 }
 
 impl<'a> Uninstaller<'a> {
@@ -91,7 +93,15 @@ impl<'a> Uninstaller<'a> {
             remover,
             scanner,
             installed,
+            history: RemovedApps::for_env(env),
         }
+    }
+
+    /// Records uninstalled apps in `history` instead of the default file in
+    /// the data directory.
+    pub fn with_history(mut self, history: RemovedApps) -> Self {
+        self.history = history;
+        self
     }
 
     /// Running instances of the scanned app, covering every copy with its
@@ -163,7 +173,7 @@ impl<'a> Uninstaller<'a> {
             }
         }
 
-        let removal = self.remover.execute(&plan, mode, progress);
+        let mut removal = self.remover.execute(&plan, mode, progress);
         steps.push(StepResult::new(
             "Remove files",
             removal.failed.is_empty(),
@@ -186,6 +196,15 @@ impl<'a> Uninstaller<'a> {
         });
         if (bundle_removed || prefs_removed) && !app.is_apple {
             steps.push(self.defaults_delete(&app.bundle_id));
+        }
+        if bundle_removed && !app.is_apple {
+            // Lets a later orphan scan recognise this app's leftovers.
+            if let Err(e) = self.history.record(app) {
+                removal.warnings.push(format!(
+                    "could not add {} to the removal history: {e}",
+                    app.name
+                ));
+            }
         }
         if bundle_removed {
             steps.push(self.lsregister_unregister(&app.path));

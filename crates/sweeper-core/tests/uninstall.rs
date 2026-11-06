@@ -376,3 +376,92 @@ fn run_brew_zap_uses_the_runner() {
     assert!(calls[0][0].ends_with("brew"));
     assert_eq!(calls[0][1..], ["uninstall", "--cask", "--zap", "foo"]);
 }
+
+/// Uninstalls `bundle_id` (Trash mode) recording into `history`.
+fn uninstall_recording(
+    fx: &Fixture,
+    bundle_id: &str,
+    history: sweeper_core::RemovedApps,
+    trash_failure: Option<&str>,
+) -> sweeper_core::UninstallReport {
+    let apps = installed(fx);
+    let app = app_by_id(&apps, bundle_id);
+    let policy = PathPolicy::new(&fx.env, &[]);
+    let rules = RuleSet::bundled();
+    let spot = FakeSpotlight::default();
+    let scanner = LeftoverScanner::new(&fx.env, &rules, &policy, &spot);
+    let trash = FakeTrash::new(fx.trash_dir.clone());
+    if let Some(reason) = trash_failure {
+        trash.fail_on(&app.path, reason);
+    }
+    let remover = Remover::new(&fx.env, &policy, &trash, UndoLog::for_env(&fx.env));
+    let runner = RecordingRunner::new();
+    let processes = FakeProcesses::new();
+    let u = Uninstaller::new(
+        &fx.env, &policy, &runner, &processes, &remover, &scanner, &apps,
+    )
+    .with_history(history);
+    let scan = scanner.scan(&app, &apps, &std::sync::atomic::AtomicBool::new(false));
+    u.run(&scan, RemovalMode::Trash, &mut |_| {})
+}
+
+#[test]
+fn uninstall_records_the_app_in_the_removal_history() {
+    let fx = populated();
+    let history = sweeper_core::RemovedApps::for_env(&fx.env);
+    let report = uninstall_recording(&fx, FOO, history.clone(), None);
+    assert!(
+        report.removal.warnings.is_empty(),
+        "{:?}",
+        report.removal.warnings
+    );
+    let entries = history.entries().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].bundle_id, FOO);
+    assert_eq!(entries[0].name, "Foo");
+    assert!(entries[0].removed_at > 0);
+    assert_eq!(entries[0].app_path, fx.apps_dir.join("Foo.app"));
+}
+
+#[test]
+fn apple_apps_are_never_recorded() {
+    let fx = Fixture::new();
+    fx.install("Safari", "com.apple.Safari", "17.0");
+    let history = sweeper_core::RemovedApps::for_env(&fx.env);
+    uninstall_recording(&fx, "com.apple.Safari", history.clone(), None);
+    assert!(history.entries().unwrap().is_empty());
+    // Recording directly is a no-op as well.
+    let apple = app_by_id(&installed(&fx), "com.apple.Safari");
+    history.record(&apple).unwrap();
+    assert!(!history.contains("com.apple.Safari"));
+}
+
+#[test]
+fn history_is_not_written_when_the_bundle_was_not_removed() {
+    let fx = populated();
+    let history = sweeper_core::RemovedApps::for_env(&fx.env);
+    let report = uninstall_recording(&fx, FOO, history.clone(), Some("operation not permitted"));
+    assert!(report
+        .removal
+        .failed
+        .iter()
+        .any(|(p, _)| *p == fx.apps_dir.join("Foo.app")));
+    assert!(history.entries().unwrap().is_empty());
+}
+
+#[test]
+fn history_write_failure_is_only_a_warning() {
+    let fx = populated();
+    // A file where the history's parent directory should be.
+    let blocker = fx.tmp.path().join("blocker");
+    std::fs::write(&blocker, b"x").unwrap();
+    let history = sweeper_core::RemovedApps::new(blocker.join("removed-apps.json"));
+    let report = uninstall_recording(&fx, FOO, history, None);
+    assert!(report.removal.failed.is_empty());
+    assert!(report
+        .removal
+        .warnings
+        .iter()
+        .any(|w| w.contains("removal history")));
+    assert!(!fx.apps_dir.join("Foo.app").exists());
+}
