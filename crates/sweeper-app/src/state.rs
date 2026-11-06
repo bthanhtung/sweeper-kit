@@ -8,25 +8,58 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use serde::{Deserialize, Serialize};
 use sweeper_core::{
-    is_valid_bundle_id, ActionLog, AppInfo, CommandRunner, Env, PathPolicy, Processes,
-    RealProcesses, RealRunner, RealSpotlight, RealTrasher, RuleSet, Spotlight, Trasher,
+    cleaner_roots, is_valid_bundle_id, ActionLog, AppInfo, CleanOptions, CleanRules, CleanScan,
+    CommandRunner, Env, PathPolicy, Processes, RealProcesses, RealRunner, RealSpotlight,
+    RealToolLocator, RealTrasher, RuleSet, Spotlight, ToolLocator, Trasher,
 };
 
 const SETTINGS_FILE: &str = "settings.json";
 const USER_RULES_FILE: &str = "rules.json";
+const USER_CLEAN_RULES_FILE: &str = "cleaner-rules.json";
+/// Valid range of [`Settings::downloads_age_days`] (ten years at most).
+pub const DOWNLOADS_AGE_RANGE: std::ops::RangeInclusive<u32> = 1..=3650;
+/// Largest accepted [`Settings::min_item_size_mb`] (1 TB).
+pub const MAX_MIN_ITEM_SIZE_MB: u64 = 1_000_000;
+const BYTES_PER_MB: u64 = 1_000_000;
 /// Folders that can never be added as an app folder.
 const FORBIDDEN_FOLDERS: [&str; 4] = ["/System", "/usr", "/bin", "/sbin"];
 const MAX_LIST_LEN: usize = 256;
 const MAX_ENTRY_LEN: usize = 1024;
 
 /// User preferences, stored as JSON in the data directory.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub extra_app_folders: Vec<PathBuf>,
     /// Absolute paths (or `~/...`) and bundle identifiers that are never removed.
     pub protected: Vec<String>,
     pub delete_immediately: bool,
+    /// The cleaner hides entries smaller than this many megabytes (0 = none hidden).
+    pub min_item_size_mb: u64,
+    /// Downloads older than this many days are offered by the cleaner.
+    pub downloads_age_days: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            extra_app_folders: Vec::new(),
+            protected: Vec::new(),
+            delete_immediately: false,
+            min_item_size_mb: 0,
+            downloads_age_days: 30,
+        }
+    }
+}
+
+impl Settings {
+    /// Scan options for the cleaner.
+    pub fn clean_options(&self) -> CleanOptions {
+        CleanOptions {
+            downloads_age_days: self.downloads_age_days,
+            min_size: self.min_item_size_mb.saturating_mul(BYTES_PER_MB),
+        }
+    }
 }
 
 /// Everything the command functions need. Tests build one from doubles.
@@ -39,11 +72,18 @@ pub struct AppContext {
     pub spotlight: Box<dyn Spotlight>,
     pub processes: Box<dyn Processes>,
     pub trasher: Box<dyn Trasher>,
+    /// Bundled cleaner rules merged with the user's `cleaner-rules.json`.
+    pub clean_rules: CleanRules,
+    pub tools: Box<dyn ToolLocator>,
+    /// The normal policy plus the roots the cleaner rules need (`~/.npm`, ...).
+    pub cleaner_policy: PathPolicy,
     pub log: ActionLog,
     /// Last list produced by `list_apps`; used when scanning and uninstalling.
     pub installed: Mutex<Vec<AppInfo>>,
     /// Why the user rules file was ignored, if it was.
     pub rules_warning: Option<String>,
+    /// Why the user cleaner rules file was ignored, if it was.
+    pub clean_rules_warning: Option<String>,
     default_app_dirs: Vec<PathBuf>,
 }
 
@@ -63,9 +103,13 @@ impl AppContext {
         // Folders may have disappeared since they were saved.
         settings.extra_app_folders.retain(|p| p.is_dir());
         let (rules, rules_warning) = load_rules(&env, rules);
+        let (clean_rules, clean_rules_warning) = load_clean_rules(&env);
         let mut ctx = AppContext {
             log: ActionLog::new(&env),
             policy: PathPolicy::new(&env, &[]),
+            cleaner_policy: PathPolicy::new(&env, &[]),
+            clean_rules,
+            tools: Box::new(RealToolLocator),
             env,
             rules,
             settings: Settings::default(),
@@ -75,10 +119,20 @@ impl AppContext {
             trasher,
             installed: Mutex::new(Vec::new()),
             rules_warning,
+            clean_rules_warning,
             default_app_dirs,
         };
         ctx.apply_settings(settings);
+        for root in ctx.cleaner_policy.rejected_extra_roots() {
+            ctx.log.record("rejected-cleaner-root", root);
+        }
         ctx
+    }
+
+    /// Uses another tool locator for the cleaner actions (tests).
+    pub fn with_tools(mut self, tools: Box<dyn ToolLocator>) -> AppContext {
+        self.tools = tools;
+        self
     }
 
     /// The context used by the running application.
@@ -103,6 +157,8 @@ impl AppContext {
         }
         self.env.app_dirs = dirs;
         self.policy = PathPolicy::new(&self.env, &settings.protected);
+        self.cleaner_policy = PathPolicy::new(&self.env, &settings.protected)
+            .with_extra_roots(&cleaner_roots(&self.env, &self.clean_rules));
         self.settings = settings;
     }
 
@@ -138,10 +194,34 @@ fn load_rules(env: &Env, base: RuleSet) -> (RuleSet, Option<String>) {
     }
 }
 
+fn load_clean_rules(env: &Env) -> (CleanRules, Option<String>) {
+    let base = CleanRules::bundled();
+    let path = env.data_dir.join(USER_CLEAN_RULES_FILE);
+    if !path.exists() {
+        return (base, None);
+    }
+    match CleanRules::load(&path) {
+        Ok(user) => (base.merge(user), None),
+        Err(e) => (base, Some(format!("Ignored {}: {e}", path.display()))),
+    }
+}
+
 /// Checks `settings` and returns the normalized form to store.
 pub fn validate_settings(settings: &Settings) -> Result<Settings, String> {
     if settings.extra_app_folders.len() > MAX_LIST_LEN || settings.protected.len() > MAX_LIST_LEN {
         return Err("Too many entries".into());
+    }
+    if !DOWNLOADS_AGE_RANGE.contains(&settings.downloads_age_days) {
+        return Err(format!(
+            "Old downloads must be older than {} to {} days",
+            DOWNLOADS_AGE_RANGE.start(),
+            DOWNLOADS_AGE_RANGE.end()
+        ));
+    }
+    if settings.min_item_size_mb > MAX_MIN_ITEM_SIZE_MB {
+        return Err(format!(
+            "Minimum item size must be at most {MAX_MIN_ITEM_SIZE_MB} MB"
+        ));
     }
     let mut folders: Vec<PathBuf> = Vec::new();
     for folder in &settings.extra_app_folders {
@@ -173,6 +253,8 @@ pub fn validate_settings(settings: &Settings) -> Result<Settings, String> {
         extra_app_folders: folders,
         protected,
         delete_immediately: settings.delete_immediately,
+        min_item_size_mb: settings.min_item_size_mb,
+        downloads_age_days: settings.downloads_age_days,
     })
 }
 
@@ -248,6 +330,9 @@ pub struct AppState {
     pub ctx: Arc<RwLock<AppContext>>,
     pub scan_cancel: CancelSlot,
     pub sizes_cancel: CancelSlot,
+    pub clean_cancel: CancelSlot,
+    /// Last cleaner scan; plans are always rebuilt from it, never from the UI.
+    pub clean_scan: Mutex<Option<CleanScan>>,
     /// An app opened before the UI was ready to listen for `open-app`.
     pub pending_open: Mutex<Option<PathBuf>>,
 }
@@ -258,6 +343,8 @@ impl AppState {
             ctx: Arc::new(RwLock::new(ctx)),
             scan_cancel: CancelSlot::default(),
             sizes_cancel: CancelSlot::default(),
+            clean_cancel: CancelSlot::default(),
+            clean_scan: Mutex::new(None),
             pending_open: Mutex::new(None),
         }
     }

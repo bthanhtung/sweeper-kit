@@ -197,6 +197,7 @@ fn settings_round_trip_and_extra_folders_are_listed() {
         extra_app_folders: vec![extra.clone()],
         protected: vec!["com.keep.me".into(), "~/Documents".into()],
         delete_immediately: true,
+        ..Settings::default()
     };
     let saved = commands::save_settings(&mut h.ctx, &wanted).expect("save");
     assert_eq!(saved, wanted);

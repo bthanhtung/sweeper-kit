@@ -2,6 +2,7 @@
 //! `#[tauri::command]` wrappers. Every filesystem decision is made by
 //! `sweeper-core`; nothing here touches files except the settings store.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
@@ -10,9 +11,10 @@ use std::time::Duration;
 use serde::Serialize;
 use sweeper_core::{
     apply_preset as core_apply_preset, brew_zap_command as core_brew_zap_command, compute_sizes,
-    full_disk_access, team_id, AppCatalog, AppInfo, FdaStatus, LeftoverScanner, Preset, Progress,
-    QuitOutcome, RemovalMode, RemovalPlan, Remover, RunningApp, ScanResult, StepResult, UndoEntry,
-    UndoLog, UninstallReport, Uninstaller,
+    full_disk_access, team_id, AppCatalog, AppInfo, CacheScanner, CleanPlan, CleanReport,
+    CleanScan, Cleaner, FdaStatus, LeftoverScanner, Preset, Progress, QuitOutcome, RemovalMode,
+    RemovalPlan, Remover, RunningApp, ScanResult, StepResult, UndoEntry, UndoLog, UninstallReport,
+    Uninstaller,
 };
 
 use crate::state::{lock, save_settings as store_settings, AppContext, AppState, Settings};
@@ -21,6 +23,8 @@ use crate::state::{lock, save_settings as store_settings, AppContext, AppState, 
 pub const CANCELLED: &str = "cancelled";
 /// How long an app gets to quit before the UI offers to force it.
 pub const QUIT_GRACE: Duration = Duration::from_secs(5);
+/// Error when the cleaner has no scan to work from.
+const NO_SCAN: &str = "Scan first.";
 /// Apps sized per batch, so sizes reach the UI progressively.
 const SIZE_BATCH: usize = 8;
 
@@ -207,7 +211,10 @@ pub fn reveal_target(ctx: &AppContext, path: &Path) -> Result<PathBuf, String> {
     if ctx.env.app_dirs.iter().any(|d| d == path) {
         return Ok(path.to_path_buf());
     }
-    ctx.policy.check(path).map_err(|e| e.to_string())
+    ctx.policy
+        .check(path)
+        .or_else(|_| ctx.cleaner_policy.check(path))
+        .map_err(|e| e.to_string())
 }
 
 pub fn get_settings(ctx: &AppContext) -> Settings {
@@ -223,6 +230,70 @@ pub fn undo_entries(ctx: &AppContext) -> Result<Vec<UndoEntry>, String> {
     UndoLog::for_env(&ctx.env)
         .entries()
         .map_err(|e| format!("Could not read the undo list: {e}"))
+}
+
+// ---- cleaner ---------------------------------------------------------------
+
+/// Scans for cleanable entries. Returns [`CANCELLED`] when superseded.
+pub fn scan_cleaner(ctx: &AppContext, cancel: &AtomicBool) -> Result<CleanScan, String> {
+    let scanner = CacheScanner::new(
+        &ctx.env,
+        &ctx.clean_rules,
+        &ctx.cleaner_policy,
+        &*ctx.processes,
+        &*ctx.tools,
+    )
+    .with_runner(&*ctx.runner);
+    let scan = scanner.scan(&ctx.installed_apps(), &ctx.settings.clean_options(), cancel);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CANCELLED.into());
+    }
+    Ok(scan)
+}
+
+/// `scan` with exactly the entries in `selected` checked. Unknown ids are an
+/// error; refused entries stay unchecked. Only ids come from the UI.
+fn select_entries(scan: &CleanScan, selected: &[String]) -> Result<CleanScan, String> {
+    let known: HashSet<&str> = scan.entries().map(|e| e.id.as_str()).collect();
+    if let Some(unknown) = selected.iter().find(|id| !known.contains(id.as_str())) {
+        return Err(format!("Unknown item: {unknown}. Scan again."));
+    }
+    let wanted: HashSet<&str> = selected.iter().map(String::as_str).collect();
+    let mut scan = scan.clone();
+    for entry in scan
+        .categories
+        .iter_mut()
+        .flat_map(|c| c.entries.iter_mut())
+    {
+        entry.checked = entry.refused.is_none() && wanted.contains(entry.id.as_str());
+    }
+    Ok(scan)
+}
+
+/// Dry run: exactly what cleaning the `selected` entry ids would do.
+pub fn plan_clean(scan: &CleanScan, selected: &[String]) -> Result<CleanPlan, String> {
+    Ok(CleanPlan::from_scan(&select_entries(scan, selected)?))
+}
+
+/// Cleans the `selected` entry ids of `scan`. Everything goes to the Trash
+/// except the Trash category, which core deletes permanently.
+pub fn clean(
+    ctx: &AppContext,
+    scan: &CleanScan,
+    selected: &[String],
+    progress: &mut dyn FnMut(Progress),
+) -> Result<CleanReport, String> {
+    let plan = plan_clean(scan, selected)?;
+    ctx.log.record("clean", &ctx.env.home);
+    let cleaner = Cleaner::new(
+        &ctx.env,
+        &ctx.cleaner_policy,
+        &*ctx.trasher,
+        UndoLog::for_env(&ctx.env),
+        &*ctx.runner,
+    )
+    .with_tools(&*ctx.tools);
+    Ok(cleaner.execute(&plan, progress))
 }
 
 // ---- Tauri wrappers --------------------------------------------------------
@@ -385,6 +456,53 @@ pub mod wrappers {
     #[tauri::command]
     pub fn rules_warning(state: State<'_, AppState>) -> Option<String> {
         read(&state.ctx).rules_warning.clone()
+    }
+
+    #[tauri::command]
+    pub fn clean_rules_warning(state: State<'_, AppState>) -> Option<String> {
+        read(&state.ctx).clean_rules_warning.clone()
+    }
+
+    #[tauri::command]
+    pub async fn scan_cleaner(state: State<'_, AppState>) -> Result<CleanScan, String> {
+        let ctx = state.ctx.clone();
+        let cancel = state.clean_cancel.renew();
+        let scan = blocking(move || super::scan_cleaner(&read(&ctx), &cancel)).await??;
+        *lock(&state.clean_scan) = Some(scan.clone());
+        Ok(scan)
+    }
+
+    #[tauri::command]
+    pub fn plan_clean(
+        state: State<'_, AppState>,
+        selected: Vec<String>,
+    ) -> Result<CleanPlan, String> {
+        let stored = lock(&state.clean_scan);
+        let scan = stored.as_ref().ok_or(NO_SCAN)?;
+        super::plan_clean(scan, &selected)
+    }
+
+    #[tauri::command]
+    pub async fn clean(
+        app: AppHandle,
+        state: State<'_, AppState>,
+        selected: Vec<String>,
+    ) -> Result<CleanReport, String> {
+        // Taking the scan makes a second request fail instead of cleaning twice.
+        let scan = lock(&state.clean_scan).take().ok_or(NO_SCAN)?;
+        let ctx = state.ctx.clone();
+        let for_work = scan.clone();
+        let result = blocking(move || {
+            super::clean(&read(&ctx), &for_work, &selected, &mut |p| {
+                let _ = app.emit("clean-progress", p);
+            })
+        })
+        .await?;
+        if result.is_err() {
+            // Nothing ran (invalid selection): keep the scan for a retry.
+            lock(&state.clean_scan).get_or_insert(scan);
+        }
+        result
     }
 
     /// The app handed over before the UI started listening, if any.

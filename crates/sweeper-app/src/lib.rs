@@ -60,6 +60,10 @@ pub fn run() {
             cmd::save_settings,
             cmd::undo_entries,
             cmd::rules_warning,
+            cmd::clean_rules_warning,
+            cmd::scan_cleaner,
+            cmd::plan_clean,
+            cmd::clean,
             cmd::take_pending_open,
         ])
         .build(tauri::generate_context!())
