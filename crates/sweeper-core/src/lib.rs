@@ -8,7 +8,9 @@ pub mod catalog;
 pub mod cleaner;
 pub mod env;
 mod fsutil;
+pub mod history;
 pub mod log;
+pub mod orphans;
 pub mod path_policy;
 pub mod remover;
 pub mod rules;
@@ -28,11 +30,13 @@ pub use cleaner::{
     CleanScan, Cleaner, RealToolLocator, Tool, ToolLocator,
 };
 pub use env::{Env, SELF_BUNDLE_ID};
+pub use history::{RemovedApp, RemovedApps};
 pub use log::ActionLog;
+pub use orphans::{Confidence, OrphanFinder, OrphanGroup, OrphanLocation, OrphanRules, OrphanScan};
 pub use path_policy::{PathPolicy, PolicyError};
 pub use remover::{
     PlanItem, Progress, RemovalMode, RemovalPlan, RemovalReport, Removed, Remover, RestoreError,
-    UndoEntry, UndoLog,
+    UndoBatch, UndoEntry, UndoEntryStatus, UndoLog,
 };
 pub use rules::{Category, Location, MatchKind, RuleSet, RulesError};
 pub use scanner::{apply_preset, Group, Item, LeftoverScanner, Preset, ScanResult};

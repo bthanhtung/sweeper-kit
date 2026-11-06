@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "locations": [
+    { "id": "application_support", "category": "app_data", "base": "~/Library/Application Support", "suffixes": [""] },
+    { "id": "caches", "category": "caches", "base": "~/Library/Caches", "suffixes": [""] },
+    { "id": "containers", "category": "app_data", "base": "~/Library/Containers", "suffixes": [""] },
+    { "id": "preferences", "category": "preferences", "base": "~/Library/Preferences", "suffixes": [".plist"] },
+    { "id": "saved_state", "category": "app_data", "base": "~/Library/Saved Application State", "suffixes": [".savedState"] },
+    { "id": "http_storages", "category": "cookies_state", "base": "~/Library/HTTPStorages", "suffixes": ["", ".binarycookies"] },
+    { "id": "webkit", "category": "app_data", "base": "~/Library/WebKit", "suffixes": [""] },
+    { "id": "launch_agents", "category": "background_items", "base": "~/Library/LaunchAgents", "suffixes": [".plist"] }
+  ],
+  "exclude_prefixes": [
+    "com.apple.",
+    "group.com.apple.",
+    ".",
+    "Sweeper Kit",
+    "dev.sweeperkit.",
+    "discord-"
+  ],
+  "exclude_names": [
+    "AddressBook", "CallHistoryDB", "CallHistoryTransactions", "CloudDocs", "CrashReporter",
+    "Dock", "FileProvider", "Knowledge", "MobileSync", "iCloud", "CoreParsec",
+    "DifferentialPrivacy", "icdd", "Animoji", "SyncServices", "Spotlight",
+    "com.apple.sharedfilelist", "AppStore", "Accounts", "ContextStoreAgent", "homeenergyd",
+    "identityservicesd", "networkserviced", "CloudKit", "Caches", "Logs", "ByHost", "Safari",
+    "Google", "Microsoft", "JetBrains", "Adobe", "Mozilla", "Steam", "Electron"
+  ]
+}
