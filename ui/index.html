@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Sweeper Kit</title>
+  <link rel="stylesheet" href="styles.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div class="app">
+    <nav class="sidebar" aria-label="Sections">
+      <h1 class="sidebar-title">Sweeper Kit</h1>
+      <button type="button" class="nav-item" id="nav-uninstaller" data-view="uninstaller" aria-current="page">
+        <span class="nav-glyph" aria-hidden="true">⌫</span>Uninstaller
+      </button>
+      <button type="button" class="nav-item" id="nav-settings" data-view="settings">
+        <span class="nav-glyph" aria-hidden="true">⚙</span>Settings
+      </button>
+    </nav>
+
+    <main class="view split" id="view-uninstaller" aria-label="Uninstaller">
+      <section class="list-col" aria-label="Applications">
+        <div class="toolbar">
+          <input type="search" id="search" placeholder="Search" aria-label="Search apps by name or bundle identifier" autocomplete="off" spellcheck="false">
+          <label class="sort">
+            <span class="sr-only">Sort by</span>
+            <select id="sort">
+              <option value="name">Name</option>
+              <option value="size">Size</option>
+              <option value="used">Last used</option>
+            </select>
+          </label>
+        </div>
+        <div id="fda-banner" class="banner" role="region" aria-label="Full Disk Access" hidden></div>
+        <ul id="app-list" class="app-list" role="listbox" aria-label="Installed apps" tabindex="0"></ul>
+        <p id="list-empty" class="empty" hidden></p>
+      </section>
+      <section class="detail" id="detail" aria-label="Details" aria-live="polite"></section>
+    </main>
+
+    <main class="view" id="view-settings" aria-label="Settings" hidden></main>
+  </div>
+
+  <div id="error" class="toast" role="alert" hidden></div>
+  <dialog id="sheet" class="sheet" aria-labelledby="sheet-title"></dialog>
+  <div id="live" class="sr-only" role="status" aria-live="polite"></div>
+</body>
+</html>
