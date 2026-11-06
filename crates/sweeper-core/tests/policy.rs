@@ -1,0 +1,229 @@
+mod common;
+
+use std::os::unix::fs::symlink;
+use std::path::PathBuf;
+
+use common::*;
+use sweeper_core::testing::{make_app, FakeSpotlight, Fixture};
+use sweeper_core::{PathPolicy, PolicyError, SELF_BUNDLE_ID};
+
+fn policy(fx: &Fixture) -> PathPolicy {
+    PathPolicy::new(&fx.env, &[])
+}
+
+#[test]
+fn allows_leftovers_and_apps_and_returns_canonical_path() {
+    let fx = Fixture::new();
+    let app = fx.install("Foo", "com.foo.app", "1.0");
+    let cache = touch(&fx, "Library/Caches/com.foo.app");
+    let p = policy(&fx);
+    assert_eq!(p.check(&app).unwrap(), app);
+    assert_eq!(p.check(&cache).unwrap(), cache);
+}
+
+#[test]
+fn roots_themselves_and_outside_paths_are_refused() {
+    let fx = Fixture::new();
+    let p = policy(&fx);
+    assert_eq!(
+        p.check(&fx.lib("Caches")),
+        Err(PolicyError::OutsideAllowedRoots)
+    );
+    assert_eq!(p.check(&fx.apps_dir), Err(PolicyError::OutsideAllowedRoots));
+    let stray = touch(&fx, "Library/Fonts/x.ttf");
+    assert_eq!(p.check(&stray), Err(PolicyError::OutsideAllowedRoots));
+    assert_eq!(
+        p.check(&PathBuf::from("relative/path")),
+        Err(PolicyError::OutsideAllowedRoots)
+    );
+    assert_eq!(
+        p.check(&fx.lib("Caches").join("..").join("Preferences")),
+        Err(PolicyError::OutsideAllowedRoots)
+    );
+    assert_eq!(
+        p.check(&fx.lib("Caches").join("missing")),
+        Err(PolicyError::NotFound)
+    );
+}
+
+#[test]
+fn nested_app_dir_root_cannot_be_removed() {
+    let mut fx = Fixture::new();
+    let utilities = fx.apps_dir.join("Utilities");
+    std::fs::create_dir_all(&utilities).unwrap();
+    fx.env.app_dirs.push(utilities.clone());
+    assert_eq!(
+        policy(&fx).check(&utilities),
+        Err(PolicyError::OutsideAllowedRoots)
+    );
+}
+
+#[test]
+fn symlink_to_outside_is_refused_and_not_removed() {
+    let fx = Fixture::new();
+    fx.install("Foo", "com.foo.app", "1.0");
+    let outside = outside_dir(&fx);
+    let link = fx.lib("Caches").join("com.foo.app");
+    symlink(&outside, &link).unwrap();
+
+    assert_eq!(policy(&fx).check(&link), Err(PolicyError::SymlinkEscape));
+
+    let result = scan(&fx, "com.foo.app");
+    let item = result
+        .items()
+        .find(|i| i.path == link)
+        .expect("symlink listed");
+    assert!(!item.checked);
+    assert!(item.refused.as_deref().unwrap().contains("symbolic link"));
+}
+
+#[test]
+fn symlink_inside_allowed_roots_is_accepted() {
+    let fx = Fixture::new();
+    let real = touch_dir(&fx, "Library/Application Support/real");
+    let link = fx.lib("Caches").join("alias");
+    symlink(&real, &link).unwrap();
+    assert_eq!(policy(&fx).check(&link).unwrap(), link);
+}
+
+#[test]
+fn symlinked_parent_directory_is_refused() {
+    let fx = Fixture::new();
+    let outside = outside_dir(&fx);
+    let linked = fx.lib("Caches").join("linked");
+    symlink(&outside, &linked).unwrap();
+    assert_eq!(
+        policy(&fx).check(&linked.join("precious.txt")),
+        Err(PolicyError::SymlinkEscape)
+    );
+    assert!(outside.join("precious.txt").exists());
+}
+
+#[test]
+fn dangling_symlink_is_refused() {
+    let fx = Fixture::new();
+    let link = fx.lib("Caches").join("dangling");
+    symlink(fx.tmp.path().join("nowhere"), &link).unwrap();
+    assert_eq!(policy(&fx).check(&link), Err(PolicyError::SymlinkEscape));
+}
+
+#[test]
+fn protected_paths_and_prefixes_are_refused() {
+    let fx = Fixture::new();
+    let dir = touch_dir(&fx, "Library/Application Support/Keep");
+    let inner = dir.join("data.bin");
+    let other = touch(&fx, "Library/Application Support/Keeper");
+    let p = PathPolicy::new(&fx.env, &[dir.display().to_string()]);
+    assert_eq!(p.check(&dir), Err(PolicyError::Protected));
+    assert_eq!(p.check(&inner), Err(PolicyError::Protected));
+    assert!(
+        p.check(&other).is_ok(),
+        "prefix match is per path component"
+    );
+}
+
+#[test]
+fn protected_bundle_id_is_refused() {
+    let fx = Fixture::new();
+    let app = fx.install("Secret", "com.corp.secret", "1.0");
+    let p = PathPolicy::new(&fx.env, &["com.corp.secret".to_string()]);
+    assert_eq!(p.check(&app), Err(PolicyError::Protected));
+
+    let result = scan_with(
+        &fx,
+        "com.corp.secret",
+        &["com.corp.secret".to_string()],
+        &FakeSpotlight::default(),
+    );
+    let item = &result.groups[0].items[0];
+    assert!(!item.checked && item.refused.is_some());
+}
+
+#[test]
+fn apple_apps_are_read_only() {
+    let fx = Fixture::new();
+    let app = fx.install("Calc", "com.apple.calculator", "1.0");
+    touch(&fx, "Library/Preferences/com.apple.calculator.plist");
+    assert!(matches!(
+        policy(&fx).check(&app),
+        Err(PolicyError::Denied(_))
+    ));
+
+    let result = scan(&fx, "com.apple.calculator");
+    assert!(result.app.is_apple);
+    assert!(result.items().count() >= 2);
+    for item in result.items() {
+        assert!(!item.checked);
+        assert_eq!(item.refused.as_deref(), Some("Apple app — read only"));
+    }
+}
+
+#[test]
+fn sweeper_kit_itself_and_its_data_are_refused() {
+    let fx = Fixture::new();
+    let me = fx.install("Sweeper Kit", SELF_BUNDLE_ID, "1.0");
+    let p = policy(&fx);
+    assert!(matches!(p.check(&me), Err(PolicyError::Denied(_))));
+
+    let data = touch(&fx, "Library/Application Support/Sweeper Kit/undo-log.json");
+    assert!(matches!(p.check(&data), Err(PolicyError::Denied(_))));
+    assert!(matches!(
+        p.check(data.parent().unwrap()),
+        Err(PolicyError::Denied(_))
+    ));
+}
+
+#[test]
+fn personal_and_private_folders_are_denied() {
+    let fx = Fixture::new();
+    let p = policy(&fx);
+    for rel_path in [
+        "Documents/report.docx",
+        "Desktop/a.txt",
+        "Pictures/b.png",
+        "Movies/c.mov",
+        "Music/d.mp3",
+        "Downloads/e.zip",
+        "Library/Keychains/login.keychain-db",
+        "Library/Mail/V10/x",
+        "Library/Messages/chat.db",
+        "Library/Mobile Documents/com~apple~CloudDocs/f",
+    ] {
+        let path = touch(&fx, rel_path);
+        assert!(
+            matches!(p.check(&path), Err(PolicyError::Denied(_))),
+            "{rel_path} must be denied"
+        );
+    }
+}
+
+#[test]
+fn apple_containers_and_photos_libraries_are_denied() {
+    let fx = Fixture::new();
+    let p = policy(&fx);
+    for rel_path in [
+        "Library/Containers/com.apple.Notes/Data/x",
+        "Library/Group Containers/group.com.apple.notes/x",
+        "Library/Group Containers/ABCDE12345.com.apple.mail/x",
+        "Library/Application Support/Library.photoslibrary/originals/x",
+    ] {
+        let path = touch(&fx, rel_path);
+        assert!(
+            matches!(p.check(&path), Err(PolicyError::Denied(_))),
+            "{rel_path} must be denied"
+        );
+    }
+    let third_party = touch(&fx, "Library/Containers/com.foo.app/Data/x");
+    assert!(p.check(&third_party).is_ok());
+}
+
+#[test]
+fn app_with_apple_id_in_unusual_dir_is_denied_even_inside_bundle() {
+    let fx = Fixture::new();
+    let app = make_app(&fx.apps_dir, "Pages", "com.apple.iWork.Pages", "1.0");
+    let inner = app.join("Contents/MacOS/Pages");
+    assert!(matches!(
+        policy(&fx).check(&inner),
+        Err(PolicyError::Denied(_))
+    ));
+}

@@ -1,0 +1,28 @@
+[package]
+name = "sweeper-core"
+version = "0.1.0"
+description = "Core library of Sweeper Kit: app catalog, leftover scanner and safe remover"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# Exposes the test doubles and fixture helpers in `testing` to other crates.
+testing = ["dep:tempfile"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+plist.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+tempfile = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-app-kit.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+sweeper-core = { path = ".", features = ["testing"] }
