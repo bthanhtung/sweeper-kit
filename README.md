@@ -16,7 +16,7 @@ A free, open-source (MIT), fully offline app uninstaller for macOS. Pick an app,
 
 - It never touches Apple apps (they are read-only) or anything inside the deny list below.
 - It has no network code: no telemetry, no update checks, no accounts.
-- It does not clean system-wide caches (only your own `~/Library` and home folder), find orphaned leftovers of already-deleted apps, restore from the Trash, or work with administrator rights. Those are planned (see the milestones).
+- It does not clean system-wide caches (only your own `~/Library` and home folder) or work with administrator rights. Those are planned (see the milestones).
 - It does not manage the login items of other apps beyond the System Events attempt described in [Limitations](#limitations).
 
 ## Cache & Junk Cleaner
@@ -72,11 +72,51 @@ What the cleaner lists is data: `rules/macos-cleaner.json`. Your own rules go in
 - Rules whose last path segment is personal browser data (History, Cookies, Login Data, Web Data, Bookmarks, Favicons, `places.sqlite`, `key4.db`, `logins.json`, Preferences, Local State, ...) are rejected, and locations must lie inside your home folder and outside protected areas.
 - `action` is chosen **by id only**: `simctl_delete_unavailable`, `brew_cleanup` or `docker_prune`. Rules cannot supply commands or arguments.
 
+## Leftover Finder
+
+The **Leftovers** section (⌘L starts a scan) lists data in your `~/Library` that no installed app claims, for example caches of an app you deleted by dragging it to the Trash. Groups are sorted by confidence, then size, and each shows a badge:
+
+| Confidence | Badge | Meaning | Pre-selected |
+| --- | --- | --- | --- |
+| High | Removed app (green) | The app was uninstalled with Sweeper Kit (recorded in `removed-apps.json`) | Yes |
+| Medium | Unclaimed bundle ID (amber) | Identifier-shaped name (`com.vendor.app`) that no installed or running app uses | No |
+| Low | Name match only (grey) | Plain folder name in Application Support or Caches that no installed app resembles; it may belong to anything | No |
+
+Nothing else is ever pre-selected. "Select all high confidence" ticks only High groups; Low groups can only be ticked by hand. Removal follows the usual flow: dry run listing exact paths, Trash by default, a report with failures and the number of items left after a rescan.
+
+What is excluded: anything an installed app owns (exact identifier, vendor prefix or child identifier, app name), identifiers of running apps or apps found elsewhere by Spotlight, Apple's own entries (`com.apple.*`, Apple containers) and a list of system and common vendor folders. Items refused by the path policy are shown greyed out.
+
+### Custom orphan rules
+
+`~/Library/Application Support/Sweeper Kit/orphan-rules.json` is merged into the bundled `rules/macos-orphans.json`. A location with the same `id` replaces the bundled one, new ids are added, and exclusions are appended. An invalid file is ignored and a notice explains why.
+
+```json
+{
+  "version": 1,
+  "locations": [
+    { "id": "logs", "category": "logs", "base": "~/Library/Logs", "suffixes": [""] }
+  ],
+  "exclude_names": ["MyCompanyTool"],
+  "exclude_prefixes": ["com.mycompany."]
+}
+```
+
+- `base` must start with `~/Library/` and contain no `..`; `suffixes` are stripped from entry names to get the candidate key (`""` keeps the name as is).
+- `category` is one of `app_data` (default), `caches`, `preferences`, `cookies_state`, `logs`, `background_items`.
+- `exclude_names` / `exclude_prefixes` are case-insensitive and never match as orphans.
+- Plain (non-identifier) names are only considered in the `application_support` and `caches` locations.
+
+## History & Restore
+
+The **History** section lists everything Sweeper Kit moved to the Trash, newest removal first, with date, item count and size. Expand a removal to see each item's original path, size and status: **In Trash** or **No longer in Trash**. Tick restorable items, choose **Restore…**, review what goes back where, and get a per-item result. Restore never overwrites an existing file or folder, and every destination is checked against the path policy. Entries whose Trash item is gone can be dropped with **Remove from history**; entries still in the Trash cannot. The uninstaller report links here ("View in History").
+
+Settings → **Removed apps history** lists the apps that count as "removed with Sweeper Kit". **Forget** drops one, which lowers the confidence of its future leftovers from High to Medium.
+
 ## Safety model
 
 - **Dry run first.** Nothing is removed until you confirm a sheet listing every path and the total size.
 - **Trash by default.** Items are moved to the Trash. Permanent deletion is an explicit setting, and the confirm button turns red when it is on.
-- **Undo log.** Every Trash move is recorded in `~/Library/Application Support/Sweeper Kit/undo-log.json` (original path, Trash location, size). Restoring from the UI arrives in a later milestone; the data is already there. Every action is also appended to `~/Library/Logs/Sweeper Kit/sweeper-kit.log` (paths only, never file contents).
+- **Undo log.** Every Trash move is recorded in `~/Library/Application Support/Sweeper Kit/undo-log.json` (original path, Trash location, size). The History view restores from it (see [History & Restore](#history--restore)). Every action is also appended to `~/Library/Logs/Sweeper Kit/sweeper-kit.log` (paths only, never file contents).
 - **Path policy deny list.** Every path is validated against a `PathPolicy` when it is scanned and again immediately before it is removed: it must be absolute, inside an allowed root (your app folders or specific `~/Library` folders), and not an Apple container, system location, Sweeper Kit's own data, a symlink escaping the roots, or anything on your protected list. Refused items are shown greyed out with the reason and cannot be checked.
 - **Matching order.** Leftovers are attributed by exact bundle identifier first, then by identifier prefix or containment where a location allows it, then by app name (only for names of three or more characters), and shared team-wide entries are listed but never pre-checked. Files that belong to another installed app are skipped.
 - **No network.** The webview has a strict Content Security Policy (`default-src 'self'`), the app has no HTTP, shell or updater plugin, and the UI loads nothing from the internet. The webview can only call the app's own commands, native dialogs and event listeners.
@@ -140,7 +180,7 @@ Your own rules go in `~/Library/Application Support/Sweeper Kit/rules.json`, in 
 
 **Is anything sent anywhere?** No. There is no networking code and the webview is locked down by its CSP.
 
-**Can I get items back?** Yes, unless you turned on "Delete immediately": open the Trash and use Put Back. The undo log keeps the original locations.
+**Can I get items back?** Yes, unless you turned on "Delete immediately": open **History**, tick the items and choose Restore (or use Put Back in the Trash).
 
 **Why is an item greyed out?** The path policy refused it (Apple app, protected item, or a location Sweeper Kit never touches). The reason is shown under the item.
 
@@ -154,7 +194,8 @@ Your own rules go in `~/Library/Application Support/Sweeper Kit/rules.json`, in 
 | --- | --- |
 | M1: Uninstaller (core library, app, UI, smoke tests) | Done |
 | M2: Cache & Junk Cleaner (rules, core, UI, smoke tests) | Done |
-| M3–M4: leftovers of already-deleted apps, restore UI for the undo log | Planned |
+| M3: Leftover Finder and History & Restore (core, UI, smoke tests) | Done |
+| M4: administrator scope, receipts | Planned |
 
 ## License
 
