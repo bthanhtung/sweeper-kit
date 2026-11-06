@@ -184,9 +184,16 @@ pub struct UndoEntry {
     /// Unix seconds.
     pub timestamp: u64,
     pub original: PathBuf,
+    /// Where the item is now: the Trash, or for `admin` entries the privileged
+    /// staging folder.
     pub trash_location: PathBuf,
     pub size: u64,
     pub batch_id: String,
+    /// The item was moved by the privileged helper into the root-owned staging
+    /// folder. Only the helper can move it back (see
+    /// [`crate::admin::restore_admin_entries`]); [`UndoLog::restore`] refuses.
+    #[serde(default)]
+    pub admin: bool,
 }
 
 /// Why a restore was refused.
@@ -200,6 +207,8 @@ pub enum RestoreError {
     TrashItemMissing(PathBuf),
     #[error("undo entry has an invalid path")]
     InvalidEntry,
+    #[error("this item was removed with administrator access and can only be restored with it")]
+    RequiresAdmin,
     #[error("cannot restore: {0}")]
     Io(String),
 }
@@ -241,6 +250,28 @@ impl UndoLog {
         size: u64,
         batch_id: &str,
     ) -> io::Result<()> {
+        self.append_entry(original, trash_location, size, batch_id, false)
+    }
+
+    /// Records an item the privileged helper moved to `staging_path`.
+    pub(crate) fn append_admin(
+        &self,
+        original: &Path,
+        staging_path: &Path,
+        size: u64,
+        batch_id: &str,
+    ) -> io::Result<()> {
+        self.append_entry(original, staging_path, size, batch_id, true)
+    }
+
+    fn append_entry(
+        &self,
+        original: &Path,
+        trash_location: &Path,
+        size: u64,
+        batch_id: &str,
+        admin: bool,
+    ) -> io::Result<()> {
         let mut entries = self.entries()?;
         entries.push(UndoEntry {
             id: new_id(),
@@ -249,6 +280,7 @@ impl UndoLog {
             trash_location: trash_location.to_path_buf(),
             size,
             batch_id: batch_id.to_string(),
+            admin,
         });
         self.write(&entries)
     }
@@ -289,7 +321,9 @@ impl UndoLog {
     pub fn batches(&self) -> io::Result<Vec<UndoBatch>> {
         let mut batches: Vec<UndoBatch> = Vec::new();
         for entry in self.entries()? {
-            let in_trash = fs::symlink_metadata(&entry.trash_location).is_ok();
+            // The staging folder is root-only, so the app cannot look inside;
+            // the helper reports a missing item when the restore is attempted.
+            let in_trash = entry.admin || fs::symlink_metadata(&entry.trash_location).is_ok();
             let status = UndoEntryStatus { entry, in_trash };
             match batches
                 .iter_mut()
@@ -402,6 +436,9 @@ pub struct UndoBatch {
 /// re-created one level at a time and each new level must be allowed.
 fn restore_entry(entry: &UndoEntry, policy: Option<&PathPolicy>) -> Result<PathBuf, RestoreError> {
     let io_err = |e: io::Error| RestoreError::Io(e.to_string());
+    if entry.admin {
+        return Err(RestoreError::RequiresAdmin);
+    }
     let sane = |p: &Path| {
         p.is_absolute()
             && p.components()
@@ -467,7 +504,7 @@ fn unix_now() -> u64 {
 }
 
 /// Unique within a machine: nanosecond clock plus a process-wide counter.
-fn new_id() -> String {
+pub(crate) fn new_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

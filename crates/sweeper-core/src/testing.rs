@@ -23,6 +23,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct RecordingRunner {
     calls: Mutex<Vec<Vec<String>>>,
     responses: Mutex<HashMap<String, io::Result<CommandOutput>>>,
+    /// Answers keyed by the full `program arg...` list; they win over `responses`.
+    exact: Mutex<HashMap<Vec<String>, CommandOutput>>,
 }
 
 impl RecordingRunner {
@@ -34,6 +36,14 @@ impl RecordingRunner {
     /// Unscripted programs succeed with empty output.
     pub fn respond(&self, program: &str, output: CommandOutput) {
         lock(&self.responses).insert(program.to_string(), Ok(output));
+    }
+
+    /// Scripts the answer for exactly `program args...`; takes precedence over
+    /// [`RecordingRunner::respond`].
+    pub fn respond_args(&self, program: &str, args: &[&str], output: CommandOutput) {
+        let mut key = vec![program.to_string()];
+        key.extend(args.iter().map(|a| a.to_string()));
+        lock(&self.exact).insert(key, output);
     }
 
     /// Makes `program` fail to start.
@@ -63,7 +73,11 @@ impl CommandRunner for RecordingRunner {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput> {
         let mut call = vec![program.to_string()];
         call.extend(args.iter().map(|a| a.to_string()));
+        let scripted = lock(&self.exact).get(&call).cloned();
         lock(&self.calls).push(call);
+        if let Some(output) = scripted {
+            return Ok(output);
+        }
         match lock(&self.responses).get(program) {
             Some(Ok(o)) => Ok(o.clone()),
             Some(Err(e)) => Err(io::Error::new(e.kind(), e.to_string())),
@@ -294,12 +308,14 @@ impl Fixture {
         }
         fs::create_dir_all(&apps_dir).expect("create apps dir");
         fs::create_dir_all(&caskroom).expect("create caskroom");
+        fs::create_dir_all(root.join("system")).expect("create fake system root");
         let env = Env {
             app_dirs: vec![apps_dir.clone()],
             caskroom_dirs: vec![caskroom],
             uid: 501,
             self_bundle_id: SELF_BUNDLE_ID.to_string(),
             data_dir: home.join("Library/Application Support/Sweeper Kit"),
+            system_root: root.join("system"),
             home,
         };
         Fixture {
@@ -308,6 +324,11 @@ impl Fixture {
             apps_dir,
             trash_dir,
         }
+    }
+
+    /// `<sub>` below the fake system root, e.g. `sys("Library/LaunchDaemons")`.
+    pub fn sys(&self, sub: &str) -> PathBuf {
+        self.env.system_root.join(sub)
     }
 
     /// `~/Library/<sub>` in the fake home.
