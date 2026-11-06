@@ -25,6 +25,7 @@
     "active": true,
     "targets": ["app"],
     "category": "Utility",
+    "externalBin": ["binaries/sweeper-helper"],
     "shortDescription": "Free, offline app uninstaller",
     "copyright": "MIT License",
     "icon": [

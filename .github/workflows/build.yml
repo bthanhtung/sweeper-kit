@@ -59,6 +59,19 @@ jobs:
             cargo install tauri-cli --version "^2" --locked
           fi
 
+      - name: Build universal privileged helper
+        # Tauri expects the sidecar for the universal target as one fat binary.
+        run: |
+          set -euo pipefail
+          for triple in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --package sweeper-helper --target "$triple"
+          done
+          mkdir -p crates/sweeper-app/binaries
+          lipo -create -output crates/sweeper-app/binaries/sweeper-helper-universal-apple-darwin \
+            target/aarch64-apple-darwin/release/sweeper-helper \
+            target/x86_64-apple-darwin/release/sweeper-helper
+          lipo -archs crates/sweeper-app/binaries/sweeper-helper-universal-apple-darwin
+
       - name: Build universal DMG
         working-directory: crates/sweeper-app
         env:
