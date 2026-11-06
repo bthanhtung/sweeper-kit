@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "locations": [
+    { "id": "application_support", "category": "app_data", "base": "~/Library/Application Support", "match": "id_or_name", "suffixes": [""], "default_checked": true },
+    { "id": "containers", "category": "app_data", "base": "~/Library/Containers", "match": "id", "suffixes": [""], "default_checked": true },
+    { "id": "group_containers", "category": "app_data", "base": "~/Library/Group Containers", "match": "team_or_id", "suffixes": [""], "default_checked": true },
+    { "id": "application_scripts", "category": "app_data", "base": "~/Library/Application Scripts", "match": "id", "suffixes": [""], "default_checked": true },
+    { "id": "caches", "category": "caches", "base": "~/Library/Caches", "match": "id_or_name", "suffixes": [""], "default_checked": true },
+    { "id": "http_storages", "category": "cookies_state", "base": "~/Library/HTTPStorages", "match": "id_prefix", "suffixes": ["", ".binarycookies"], "default_checked": true },
+    { "id": "webkit", "category": "app_data", "base": "~/Library/WebKit", "match": "id", "suffixes": [""], "default_checked": true },
+    { "id": "nsurlsessiond_downloads", "category": "caches", "base": "~/Library/Caches/com.apple.nsurlsessiond/Downloads", "match": "id", "suffixes": [""], "default_checked": true },
+    { "id": "preferences", "category": "preferences", "base": "~/Library/Preferences", "match": "id_prefix", "suffixes": [".plist"], "default_checked": true },
+    { "id": "preferences_byhost", "category": "preferences", "base": "~/Library/Preferences/ByHost", "match": "id_prefix", "suffixes": [".plist"], "default_checked": true },
+    { "id": "cookies", "category": "cookies_state", "base": "~/Library/Cookies", "match": "id", "suffixes": [".binarycookies"], "default_checked": true },
+    { "id": "saved_application_state", "category": "cookies_state", "base": "~/Library/Saved Application State", "match": "id", "suffixes": [".savedState"], "default_checked": true },
+    { "id": "logs", "category": "logs", "base": "~/Library/Logs", "match": "id_or_name", "suffixes": [""], "default_checked": true },
+    { "id": "diagnostic_reports", "category": "logs", "base": "~/Library/Logs/DiagnosticReports", "match": "name_prefix", "suffixes": [""], "default_checked": true },
+    { "id": "launch_agents", "category": "background_items", "base": "~/Library/LaunchAgents", "match": "contains_id", "suffixes": [".plist"], "default_checked": true }
+  ]
+}
