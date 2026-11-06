@@ -937,3 +937,198 @@ fn restore_admin_entries_uses_one_invocation_and_forgets_restored_entries() {
     assert_eq!(err, Err(AdminError::Cancelled));
     assert_eq!(log.entries().unwrap().len(), 2);
 }
+
+// ------------------------------------------------------ helper hardening
+
+#[test]
+fn system_policy_folds_unicode_case_in_deny_rules() {
+    let w = World::new();
+    // U+212A KELVIN SIGN lowercases to "k": APFS treats it like "K".
+    for rel in [
+        "Library/Application Support/Sweeper \u{212A}it/Staging/x",
+        "Library/Application Support/Sweeper \u{212A}it",
+        "Library/Caches/COM.APPLE.thing",
+    ] {
+        let err = w.policy.check_destination(&w.sys(rel)).unwrap_err();
+        assert!(
+            matches!(err, PolicyError::Denied(_)),
+            "{rel} should be denied, got {err:?}"
+        );
+    }
+    // Legitimate non-ASCII names stay allowed.
+    assert!(w
+        .policy
+        .check_destination(&w.sys("Library/Caches/Café Ünï"))
+        .is_ok());
+}
+
+#[test]
+fn system_policy_denies_the_protected_folders_by_identity() {
+    let w = World::new();
+    fs::create_dir_all(w.staging()).unwrap();
+    fs::create_dir_all(w.sys("Library/Apple/Updates")).unwrap();
+    // Built after the folders exist, so their (device, inode) is recorded.
+    let policy = SystemPolicy::new(&w.fx.env, &[]);
+    assert!(policy.denied_by_identity(&w.staging().join("batch/0-x")));
+    assert!(policy.denied_by_identity(&w.sys("Library/Apple/Updates/x")));
+    assert!(!policy.denied_by_identity(&w.sys("Library/Caches/com.foo.app")));
+
+    // The folder renamed into an allowed root is still recognised.
+    let moved = w.sys("Library/Caches/innocent");
+    fs::rename(w.sys("Library/Application Support/Sweeper Kit"), &moved).unwrap();
+    let err = policy
+        .check_destination(&moved.join("Staging/batch/0-x"))
+        .unwrap_err();
+    assert!(matches!(err, PolicyError::Denied(_)), "{err:?}");
+    assert!(matches!(
+        policy.check(&moved.join("Staging")),
+        Err(PolicyError::Denied(_))
+    ));
+}
+
+#[test]
+fn system_policy_identity_is_looked_up_again_for_folders_created_later() {
+    let w = World::new();
+    // `w.policy` was built before the staging folder existed.
+    fs::create_dir_all(w.staging()).unwrap();
+    assert!(w.policy.denied_by_identity(&w.staging().join("b/x")));
+    let moved = w.sys("Library/Caches/innocent");
+    fs::rename(w.sys("Library/Application Support/Sweeper Kit"), &moved).unwrap();
+    assert!(w.policy.check(&moved).is_err());
+}
+
+#[test]
+fn system_policy_denies_a_differently_cased_spelling_of_the_staging_dir() {
+    let w = World::new();
+    fs::create_dir_all(w.staging()).unwrap();
+    // Only meaningful on a case-insensitive volume (the macOS default).
+    if !w.sys("library/application support").exists() {
+        return;
+    }
+    let policy = SystemPolicy::new(&w.fx.env, &[]);
+    let odd = w.sys("library/application support/SWEEPER KIT/staging/b/x");
+    assert!(matches!(
+        policy.check_destination(&odd),
+        Err(PolicyError::Denied(_))
+    ));
+}
+
+#[test]
+fn move_fails_when_the_source_parent_is_swapped_for_a_symlink_after_validation() {
+    let w = World::new();
+    let file = w.file("Library/Application Support/com.foo.app/data.bin");
+    let parent = file.parent().unwrap().to_path_buf();
+    let aside = parent.with_file_name("com.foo.app.real");
+    let decoy_dir = w.fx.tmp.path().join("decoy");
+    write_file(&decoy_dir.join("data.bin"), 7);
+
+    let m = w.manifest(vec![mv(&file)]);
+    let result = sweeper_core::admin::execute_manifest_with_hook(
+        &m,
+        &w.policy,
+        &w.fx.env.system_root,
+        &RecordingRunner::new(),
+        &|_| {
+            fs::rename(&parent, &aside).unwrap();
+            symlink(&decoy_dir, &parent).unwrap();
+        },
+    );
+    assert!(!result.ops[0].ok, "{:?}", result.ops[0]);
+    assert!(result.ops[0].detail.contains("nothing was moved"));
+    assert_eq!(fs::metadata(decoy_dir.join("data.bin")).unwrap().len(), 7);
+    assert!(aside.join("data.bin").exists());
+    assert_eq!(fs::read_dir(w.staging().join("batch1")).unwrap().count(), 0);
+}
+
+#[test]
+fn move_fails_when_the_item_is_replaced_after_validation() {
+    let w = World::new();
+    let file = w.file("Library/Caches/item");
+    let other = w.file("Library/Caches/other");
+    let m = w.manifest(vec![mv(&file)]);
+    let result = sweeper_core::admin::execute_manifest_with_hook(
+        &m,
+        &w.policy,
+        &w.fx.env.system_root,
+        &RecordingRunner::new(),
+        &|_| {
+            // `other` is alive, so it cannot share the inode of the old item.
+            fs::rename(&other, &file).unwrap();
+        },
+    );
+    assert!(!result.ops[0].ok, "{:?}", result.ops[0]);
+    assert!(result.ops[0]
+        .detail
+        .contains("changed after it was checked"));
+    assert!(file.exists());
+}
+
+#[test]
+fn restore_fails_without_clobbering_a_destination_created_after_validation() {
+    let w = World::new();
+    let original = w.file("Library/Caches/item");
+    let moved = w.execute(&w.manifest(vec![mv(&original)]), &RecordingRunner::new());
+    let staged = moved.ops[0].staging_path.clone().unwrap();
+    let m = w.manifest(vec![AdminOp::RestoreFromStaging {
+        staging_path: staged.clone(),
+        original: original.clone(),
+    }]);
+    let result = sweeper_core::admin::execute_manifest_with_hook(
+        &m,
+        &w.policy,
+        &w.fx.env.system_root,
+        &RecordingRunner::new(),
+        &|_| fs::write(&original, b"newcomer").unwrap(),
+    );
+    assert!(!result.ops[0].ok, "{:?}", result.ops[0]);
+    assert!(result.ops[0]
+        .detail
+        .contains("destination already exists; nothing was moved"));
+    assert_eq!(fs::read(&original).unwrap(), b"newcomer");
+    assert!(staged.exists());
+}
+
+#[test]
+fn restore_refuses_when_any_staging_level_is_not_private() {
+    use std::os::unix::fs::PermissionsExt;
+    for level in [
+        "Sweeper Kit",
+        "Sweeper Kit/Staging",
+        "Sweeper Kit/Staging/batch1",
+    ] {
+        let w = World::new();
+        let original = w.file("Library/LaunchDaemons/com.foo.app.helper.plist");
+        let moved = w.execute(&w.manifest(vec![mv(&original)]), &RecordingRunner::new());
+        let staged = moved.ops[0].staging_path.clone().unwrap();
+        let dir = w.sys("Library/Application Support").join(level);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        let m = w.manifest(vec![AdminOp::RestoreFromStaging {
+            staging_path: staged.clone(),
+            original: original.clone(),
+        }]);
+        let result = w.execute(&m, &RecordingRunner::new());
+        assert!(!result.ops[0].ok, "{level}: {:?}", result.ops[0]);
+        assert!(result.ops[0].detail.contains("not a private directory"));
+        assert!(staged.exists() && !original.exists(), "{level}");
+    }
+}
+
+#[test]
+fn restore_refuses_a_symlinked_staging_level() {
+    let w = World::new();
+    let original = w.file("Library/LaunchDaemons/com.foo.app.helper.plist");
+    let moved = w.execute(&w.manifest(vec![mv(&original)]), &RecordingRunner::new());
+    let staged = moved.ops[0].staging_path.clone().unwrap();
+    // Staging is moved aside and replaced by a link to it.
+    let real = w.sys("Library/Application Support/Sweeper Kit/Staging.real");
+    fs::rename(w.staging(), &real).unwrap();
+    symlink(&real, w.staging()).unwrap();
+    let m = w.manifest(vec![AdminOp::RestoreFromStaging {
+        staging_path: staged,
+        original: original.clone(),
+    }]);
+    let result = w.execute(&m, &RecordingRunner::new());
+    assert!(!result.ops[0].ok, "{:?}", result.ops[0]);
+    assert!(!original.exists());
+    assert!(real.join("batch1/0-com.foo.app.helper.plist").exists());
+}

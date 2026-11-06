@@ -434,6 +434,20 @@ pub fn execute_manifest(
     system_root: &Path,
     runner: &dyn CommandRunner,
 ) -> AdminResult {
+    execute_manifest_with_hook(m, policy, system_root, runner, &|_| {})
+}
+
+/// [`execute_manifest`] with a test seam: `after_check(index)` runs for each
+/// move or restore after its paths were checked and before anything is
+/// renamed, so tests can swap a directory in that window.
+#[doc(hidden)]
+pub fn execute_manifest_with_hook(
+    m: &AdminManifest,
+    policy: &SystemPolicy,
+    system_root: &Path,
+    runner: &dyn CommandRunner,
+    after_check: &dyn Fn(usize),
+) -> AdminResult {
     let refuse_all = |why: String| AdminResult {
         ops: m
             .ops
@@ -452,6 +466,7 @@ pub fn execute_manifest(
         runner,
         manifest: m,
         log: HelperLog::new(system_root),
+        after_check,
     };
     AdminResult {
         ops: m
@@ -468,6 +483,7 @@ struct Executor<'a> {
     runner: &'a dyn CommandRunner,
     manifest: &'a AdminManifest,
     log: HelperLog,
+    after_check: &'a dyn Fn(usize),
 }
 
 impl Executor<'_> {
@@ -477,7 +493,7 @@ impl Executor<'_> {
             AdminOp::RestoreFromStaging {
                 staging_path,
                 original,
-            } => self.restore(staging_path, original),
+            } => self.restore(index, staging_path, original),
             AdminOp::Bootout { plist } => self.bootout(plist),
             AdminOp::ForgetReceipt { pkg_id } => self.forget(pkg_id),
         }
@@ -488,12 +504,27 @@ impl Executor<'_> {
         let name = source
             .file_name()
             .ok_or_else(|| "path has no file name".to_string())?;
+        let source_parent = source
+            .parent()
+            .ok_or_else(|| "path has no parent".to_string())?;
+        // Identity of the item that was checked; the move must find the same one.
+        let identity = fs::symlink_metadata(&source)
+            .ok()
+            .and_then(|meta| sys::identity(&meta))
+            .ok_or_else(|| "cannot identify the item".to_string())?;
         let batch_dir = self.staging_batch_dir()?;
-        let target = batch_dir.join(format!("{index}-{}", name.to_string_lossy()));
+        let target_name = std::ffi::OsString::from(format!("{index}-{}", name.to_string_lossy()));
+        let target = batch_dir.join(&target_name);
         if fs::symlink_metadata(&target).is_ok() {
             return Err("staging target already exists".into());
         }
-        fs::rename(&source, &target).map_err(|e| move_error(&e))?;
+        (self.after_check)(index);
+        sys::checked_rename(
+            self.policy.system_root(),
+            (source_parent, name, identity),
+            (&batch_dir, &target_name),
+        )
+        .map_err(|e| move_error(&e))?;
         self.log.record("stage", &source);
         Ok(OpResult {
             ok: true,
@@ -515,7 +546,12 @@ impl Executor<'_> {
         Ok(batch)
     }
 
-    fn restore(&self, staging_path: &Path, original: &Path) -> Result<OpResult, String> {
+    fn restore(
+        &self,
+        index: usize,
+        staging_path: &Path,
+        original: &Path,
+    ) -> Result<OpResult, String> {
         let staged = self
             .policy
             .check_staging(staging_path)
@@ -523,10 +559,20 @@ impl Executor<'_> {
         let batch_dir = staged
             .parent()
             .ok_or_else(|| "staging path has no parent".to_string())?;
-        verify_dir(batch_dir)?;
-        if fs::symlink_metadata(&staged).is_err() {
-            return Err("item is no longer in staging".into());
+        let staged_name = staged
+            .file_name()
+            .ok_or_else(|| "staging path has no file name".to_string())?;
+        // Every level down to the batch folder must be private and ours.
+        let staging = self.policy.staging_dir();
+        if let Some(own_dir) = staging.parent() {
+            verify_dir(own_dir)?;
         }
+        verify_dir(staging)?;
+        verify_dir(batch_dir)?;
+        let identity = fs::symlink_metadata(&staged)
+            .ok()
+            .and_then(|meta| sys::identity(&meta))
+            .ok_or_else(|| "item is no longer in staging".to_string())?;
         let target = self
             .policy
             .check_destination(original)
@@ -546,7 +592,19 @@ impl Executor<'_> {
                     .map_err(|e| e.to_string())?;
             }
         }
-        fs::rename(&staged, &target).map_err(|e| move_error(&e))?;
+        let target_parent = target
+            .parent()
+            .ok_or_else(|| "destination has no parent".to_string())?;
+        let target_name = target
+            .file_name()
+            .ok_or_else(|| "destination has no file name".to_string())?;
+        (self.after_check)(index);
+        sys::checked_rename(
+            self.policy.system_root(),
+            (batch_dir, staged_name, identity),
+            (target_parent, target_name),
+        )
+        .map_err(|e| move_error(&e))?;
         self.log.record("restore", &target);
         // Removes the batch folder once empty; a non-empty one stays.
         let _ = fs::remove_dir(batch_dir);
@@ -671,7 +729,7 @@ pub(crate) fn bundle_needs_admin(bundle: &Path) -> bool {
 /// as root and every ownership check fails closed.
 #[cfg(unix)]
 mod sys {
-    use std::ffi::CString;
+    use std::ffi::{CString, OsStr};
     use std::fs::{DirBuilder, File, Metadata, OpenOptions};
     use std::io;
     use std::os::unix::ffi::OsStrExt;
@@ -703,6 +761,205 @@ mod sys {
         e.raw_os_error() == Some(libc::EXDEV)
     }
 
+    /// (device, inode) of a file.
+    pub fn identity(meta: &Metadata) -> Option<(u64, u64)> {
+        Some((meta.dev(), meta.ino()))
+    }
+
+    /// Moves `src_name` in `src_dir` to `dst_name` in `dst_dir` without
+    /// trusting any path: both directories are opened component by component
+    /// from `root` with `O_NOFOLLOW`, the source must still be the item
+    /// recorded during validation (`expected` device and inode), and the
+    /// rename is done between the two directory descriptors. A swapped
+    /// directory or symlink fails the move and nothing is moved. An existing
+    /// destination is never replaced: on macOS the rename itself refuses to
+    /// replace it (`RENAME_EXCL`); elsewhere only the check before the rename
+    /// guards this, so a file created in between could be replaced (the helper
+    /// only runs on macOS).
+    pub fn checked_rename(
+        root: &Path,
+        (src_dir, src_name, expected): (&Path, &OsStr, (u64, u64)),
+        (dst_dir, dst_name): (&Path, &OsStr),
+    ) -> io::Result<()> {
+        let replaced = |e: io::Error| match e.raw_os_error() {
+            Some(libc::ELOOP | libc::ENOTDIR) => io::Error::other(
+                "a parent folder was replaced by a link or file; nothing was moved",
+            ),
+            _ => e,
+        };
+        let src = fd::open_dir_below(root, src_dir).map_err(replaced)?;
+        let dst = fd::open_dir_below(root, dst_dir).map_err(replaced)?;
+        let found = fd::stat_at(&src, src_name)?;
+        if found != expected {
+            return Err(io::Error::other(
+                "the item changed after it was checked; nothing was moved",
+            ));
+        }
+        // Friendlier early error only; the exclusive rename below is what
+        // guarantees nothing is overwritten.
+        if fd::stat_at(&dst, dst_name).is_ok() {
+            return Err(destination_exists());
+        }
+        fd::rename_at_no_replace(&src, src_name, &dst, dst_name).map_err(|e| {
+            if e.raw_os_error() == Some(libc::EEXIST) {
+                destination_exists()
+            } else {
+                e
+            }
+        })
+    }
+
+    fn destination_exists() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination already exists; nothing was moved",
+        )
+    }
+
+    /// Thin safe wrappers over the descriptor-relative system calls.
+    mod fd {
+        use std::ffi::{CString, OsStr};
+        use std::io;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::{Component, Path};
+
+        /// An open directory; the descriptor is closed when it is dropped.
+        pub struct Dir(OwnedFd);
+
+        fn c_name(name: &OsStr) -> io::Result<CString> {
+            CString::new(name.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+        }
+
+        fn wrap(fd: libc::c_int) -> io::Result<Dir> {
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is a freshly opened descriptor that nothing else owns.
+            Ok(Dir(unsafe { OwnedFd::from_raw_fd(fd) }))
+        }
+
+        /// Opens `root`, which the caller has already resolved (it may be
+        /// reached through links, e.g. `/`).
+        fn open_root(root: &Path) -> io::Result<Dir> {
+            let c = c_name(root.as_os_str())?;
+            // SAFETY: `c` is a valid NUL-terminated string that outlives the call.
+            wrap(unsafe {
+                libc::open(
+                    c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            })
+        }
+
+        /// Opens the directory `name` inside `parent`, refusing symlinks
+        /// (`ELOOP`) and non-directories (`ENOTDIR`).
+        fn open_child(parent: &Dir, name: &OsStr) -> io::Result<Dir> {
+            let c = c_name(name)?;
+            // SAFETY: `parent` is an open descriptor and `c` a valid C string.
+            wrap(unsafe {
+                libc::openat(
+                    parent.0.as_raw_fd(),
+                    c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            })
+        }
+
+        /// Opens `dir`, which must lie below `root`, one component at a time
+        /// without following any symlink below `root`.
+        pub fn open_dir_below(root: &Path, dir: &Path) -> io::Result<Dir> {
+            let rel = dir
+                .strip_prefix(root)
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            let mut cur = open_root(root)?;
+            for part in rel.components() {
+                match part {
+                    Component::Normal(name) => cur = open_child(&cur, name)?,
+                    _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
+                }
+            }
+            Ok(cur)
+        }
+
+        /// (device, inode) of `name` inside `dir`, not following a symlink.
+        #[allow(clippy::unnecessary_cast)] // field widths differ per platform
+        pub fn stat_at(dir: &Dir, name: &OsStr) -> io::Result<(u64, u64)> {
+            let c = c_name(name)?;
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: `dir` is open, `c` is a valid C string and `st` is writable
+            // memory of the right type.
+            let rc = unsafe {
+                libc::fstatat(
+                    dir.0.as_raw_fd(),
+                    c.as_ptr(),
+                    st.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if rc != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: fstatat succeeded, so `st` is initialized.
+            let st = unsafe { st.assume_init() };
+            Ok((st.st_dev as u64, st.st_ino as u64))
+        }
+
+        /// Atomic rename between two open directories that fails with `EEXIST`
+        /// instead of replacing an existing destination.
+        #[cfg(target_os = "macos")]
+        pub fn rename_at_no_replace(
+            from_dir: &Dir,
+            from: &OsStr,
+            to_dir: &Dir,
+            to: &OsStr,
+        ) -> io::Result<()> {
+            let (from, to) = (c_name(from)?, c_name(to)?);
+            // SAFETY: both descriptors are open and both names are valid C strings.
+            let rc = unsafe {
+                libc::renameatx_np(
+                    from_dir.0.as_raw_fd(),
+                    from.as_ptr(),
+                    to_dir.0.as_raw_fd(),
+                    to.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+
+        /// Plain `renameat(2)`: no exclusive rename is used on this platform,
+        /// so the caller's earlier existence check is the only guard and a
+        /// racing file could be replaced.
+        #[cfg(not(target_os = "macos"))]
+        pub fn rename_at_no_replace(
+            from_dir: &Dir,
+            from: &OsStr,
+            to_dir: &Dir,
+            to: &OsStr,
+        ) -> io::Result<()> {
+            let (from, to) = (c_name(from)?, c_name(to)?);
+            // SAFETY: both descriptors are open and both names are valid C strings.
+            let rc = unsafe {
+                libc::renameat(
+                    from_dir.0.as_raw_fd(),
+                    from.as_ptr(),
+                    to_dir.0.as_raw_fd(),
+                    to.as_ptr(),
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
+    }
+
     pub fn create_dirs(path: &Path, mode: u32) -> io::Result<()> {
         DirBuilder::new().recursive(true).mode(mode).create(path)
     }
@@ -720,6 +977,7 @@ mod sys {
 
 #[cfg(not(unix))]
 mod sys {
+    use std::ffi::OsStr;
     use std::fs::{File, Metadata, OpenOptions};
     use std::io;
     use std::path::Path;
@@ -742,6 +1000,19 @@ mod sys {
 
     pub fn is_cross_device(_e: &io::Error) -> bool {
         false
+    }
+
+    pub fn identity(_meta: &Metadata) -> Option<(u64, u64)> {
+        None
+    }
+
+    /// Unsupported off Unix: the helper never runs there.
+    pub fn checked_rename(
+        _root: &Path,
+        _src: (&Path, &OsStr, (u64, u64)),
+        _dst: (&Path, &OsStr),
+    ) -> io::Result<()> {
+        Err(io::Error::other("moving items is not supported here"))
     }
 
     pub fn create_dirs(path: &Path, _mode: u32) -> io::Result<()> {

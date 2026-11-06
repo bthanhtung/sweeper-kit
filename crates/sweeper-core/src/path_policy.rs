@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::catalog::read_bundle_id;
 use crate::env::Env;
@@ -346,7 +347,10 @@ pub(crate) const STAGING_REL: &str = "Library/Application Support/Sweeper Kit/St
 /// `/Library` folders and direct `*.app` children of `/Applications` pass.
 ///
 /// macOS file systems are case-insensitive by default, so every deny rule is
-/// compared case-insensitively.
+/// compared with Unicode lowercasing. APFS folds more than that (and
+/// normalizes), so the Apple and Sweeper Kit folders are additionally denied by
+/// identity: a candidate whose path or any existing ancestor is the same
+/// directory (device and inode) is refused however it is spelled.
 #[derive(Debug, Clone)]
 pub struct SystemPolicy {
     system_root: PathBuf,
@@ -354,6 +358,7 @@ pub struct SystemPolicy {
     raw_roots: Vec<PathBuf>,
     app_dirs: Vec<PathBuf>,
     denied: Vec<(PathBuf, &'static str)>,
+    denied_ids: Arc<Mutex<Vec<DeniedIdentity>>>,
     staging: PathBuf,
     launch_daemons: PathBuf,
     launch_agents: PathBuf,
@@ -405,7 +410,18 @@ impl SystemPolicy {
                 protected_ids.insert(entry.clone());
             }
         }
+        // The first three entries are the Apple and Sweeper Kit folders under
+        // the system root.
+        let denied_ids = denied[..3]
+            .iter()
+            .map(|(dir, why)| DeniedIdentity {
+                dir: dir.clone(),
+                why,
+                id: dir_identity(dir),
+            })
+            .collect();
         SystemPolicy {
+            denied_ids: Arc::new(Mutex::new(denied_ids)),
             launch_daemons: lib.join("LaunchDaemons"),
             launch_agents: lib.join("LaunchAgents"),
             system_root,
@@ -539,11 +555,46 @@ impl SystemPolicy {
         self.check_bundles(canonical)
     }
 
+    /// True if `path` or one of its existing ancestors is the Apple or
+    /// Sweeper Kit folder itself (same device and inode), whatever the
+    /// spelling. Folders that did not exist at construction are looked up
+    /// again here.
+    pub fn denied_by_identity(&self, path: &Path) -> bool {
+        self.denied_identity(path).is_some()
+    }
+
+    fn denied_identity(&self, path: &Path) -> Option<String> {
+        let mut ids = self.denied_ids.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in ids.iter_mut() {
+            if entry.id.is_none() {
+                entry.id = dir_identity(&entry.dir);
+            }
+        }
+        if ids.iter().all(|e| e.id.is_none()) {
+            return None;
+        }
+        for ancestor in path.ancestors() {
+            let Some(id) = std::fs::symlink_metadata(ancestor)
+                .ok()
+                .and_then(|m| identity_of(&m))
+            else {
+                continue;
+            };
+            if let Some(hit) = ids.iter().find(|e| e.id == Some(id)) {
+                return Some(format!("{} ({})", hit.dir.display(), hit.why));
+            }
+        }
+        None
+    }
+
     fn check_denied(&self, canonical: &Path) -> Result<(), PolicyError> {
         for (dir, why) in &self.denied {
             if starts_with_ci(canonical, dir) {
                 return Err(PolicyError::Denied(format!("{} ({why})", dir.display())));
             }
+        }
+        if let Some(what) = self.denied_identity(canonical) {
+            return Err(PolicyError::Denied(what));
         }
         let relative = canonical
             .strip_prefix(&self.system_root)
@@ -551,7 +602,7 @@ impl SystemPolicy {
         let apple = relative.components().any(|c| {
             c.as_os_str()
                 .to_str()
-                .map_or(true, |s| s.to_ascii_lowercase().starts_with("com.apple."))
+                .map_or(true, |s| s.to_lowercase().starts_with("com.apple."))
         });
         if apple {
             return Err(PolicyError::Denied("Apple item".into()));
@@ -596,14 +647,40 @@ fn split_absolute(path: &Path) -> Result<(&Path, &OsStr), PolicyError> {
     }
 }
 
-/// `starts_with` on whole components, ignoring ASCII case.
+/// A folder that must never be touched, tracked by (device, inode).
+#[derive(Debug)]
+struct DeniedIdentity {
+    dir: PathBuf,
+    why: &'static str,
+    id: Option<(u64, u64)>,
+}
+
+/// (device, inode) of an existing directory, not following a final symlink.
+fn dir_identity(dir: &Path) -> Option<(u64, u64)> {
+    std::fs::symlink_metadata(dir)
+        .ok()
+        .filter(|m| m.is_dir())
+        .and_then(|m| identity_of(&m))
+}
+
+#[cfg(unix)]
+fn identity_of(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn identity_of(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// `starts_with` on whole components, ignoring case (Unicode lowercasing).
 fn starts_with_ci(path: &Path, base: &Path) -> bool {
     let mut p = path.components();
     base.components().all(|b| {
         p.next().is_some_and(|c| {
-            c.as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+            c.as_os_str().to_string_lossy().to_lowercase()
+                == b.as_os_str().to_string_lossy().to_lowercase()
         })
     })
 }
