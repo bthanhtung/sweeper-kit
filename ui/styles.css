@@ -385,6 +385,9 @@ svg.nav-glyph { display: block; }
 .view-note { margin: 0; padding: 0 24px 4px; }
 .item .path.command { display: block; }
 .sheet-section { margin: 12px 0 2px; font-size: 13px; }
+.receipt-note { margin: 4px 0 0; font-size: 11px; }
+.receipt-label { grid-column: 3 / span 2; font-size: 12px; padding-top: 1px; }
+.item .badge[title] { cursor: help; }
 .sheet-body p.warn, .sheet-section.warn { color: var(--danger); }
 .settings .field { margin-bottom: 14px; }
 .settings .field label { display: block; margin-bottom: 4px; font-weight: 500; }

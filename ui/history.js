@@ -12,7 +12,10 @@ const hist = state.history;
 
 const restorable = (batch) => batch.entries.filter((s) => s.in_trash);
 const allStatuses = () => hist.batches.flatMap((b) => b.entries);
-const statusLabel = (s) => (s.in_trash ? 'In Trash' : 'No longer in Trash');
+const statusLabel = (s) => {
+  if (s.entry.admin) return s.in_trash ? 'In staging folder' : 'No longer in staging folder';
+  return s.in_trash ? 'In Trash' : 'No longer in Trash';
+};
 const entryLabel = (s) => `${s.entry.original}, ${formatBytes(s.entry.size)}, ${statusLabel(s)}`;
 
 /** Ticked entries that can still be restored. */
@@ -92,6 +95,7 @@ function entryView(status) {
         { class: status.in_trash ? 'badge conf-high' : 'badge conf-low' },
         statusLabel(status),
       ),
+      entry.admin && h('span', { class: 'badge conf-medium' }, 'System item'),
     ),
     h('span', { class: 'size' }, formatBytes(entry.size)),
     status.in_trash
@@ -175,14 +179,23 @@ function body_() {
 function confirmRestore() {
   const items = picked();
   if (!items.length) return;
+  const adminCount = items.filter((s) => s.entry.admin).length;
   show(
     body(
       title('Restore selected items?'),
       h(
         'p',
         { class: 'dim' },
-        `${plural(items.length, 'item')} will move out of the Trash back to where they were. Existing items are never overwritten.`,
+        `${plural(items.length, 'item')} will move back to where they were. Existing items are never overwritten.`,
       ),
+      adminCount > 0 &&
+        h(
+          'p',
+          { class: 'warn' },
+          state.adminAvailable
+            ? `${plural(adminCount, 'system item')} can only be restored with administrator access. macOS will ask for your password once.`
+            : `${plural(adminCount, 'system item')} can only be restored with administrator access, which is not available in this build.`,
+        ),
       h(
         'ul',
         { class: 'sheet-list', 'aria-label': 'Items to restore' },

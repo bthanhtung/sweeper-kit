@@ -12,6 +12,12 @@ export const state = {
   scan: null,
   preset: 'Everything',
   scanToken: 0,
+  /** The privileged helper is bundled, so administrator items can be removed. */
+  adminAvailable: false,
+  /** Installer receipts of the app in the detail pane. */
+  receipts: [],
+  /** Receipt package ids the user chose to forget; the server re-checks them. */
+  forgetReceipts: new Set(),
   settings: {
     extra_app_folders: [],
     protected: [],

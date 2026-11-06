@@ -4,7 +4,7 @@ import { $, h, clear, showError, announce } from './dom.js';
 import { invoke, listen, CANCELLED } from './api.js';
 import { highlight, initList, renderList, updateSize } from './list.js';
 import {
-  initDetail, renderDetail, showLoading, showPlaceholder,
+  initDetail, refreshDetail, renderDetail, showLoading, showPlaceholder,
 } from './detail.js';
 import { render as renderCleaner, startScan } from './cleaner.js';
 import { render as renderLeftovers, startScan as startLeftoversScan } from './leftovers.js';
@@ -33,12 +33,27 @@ async function scanApp(path) {
     if (token !== state.scanToken) return;
     state.scan = scan;
     state.preset = 'Everything';
+    state.receipts = [];
+    state.forgetReceipts = new Set();
     renderDetail();
     announce(`${scan.app.name}: ${scan.groups.length} groups of leftovers`);
+    loadReceipts(scan.app.path, token);
   } catch (e) {
     if (token !== state.scanToken || String(e) === CANCELLED) return;
     state.scan = null;
     showPlaceholder(String(e));
+  }
+}
+
+/** Receipts come after the scan (they ask `pkgutil`); a newer scan makes them irrelevant. */
+async function loadReceipts(path, token) {
+  try {
+    const receipts = await invoke('receipts', { path });
+    if (token !== state.scanToken) return;
+    state.receipts = receipts;
+    if (receipts.length) refreshDetail();
+  } catch {
+    // Receipts are optional; the scan result stays usable without them.
   }
 }
 
@@ -140,6 +155,7 @@ async function main() {
   await listen('open-app', openDropped);
   window.addEventListener('focus', refreshFda);
 
+  state.adminAvailable = await invoke('admin_available');
   await initSettings(loadApps);
   await loadApps();
   refreshFda();

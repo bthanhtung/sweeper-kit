@@ -30,11 +30,45 @@ export function showLoading(name) {
   showPlaceholder(`Scanning ${name}…`);
 }
 
-/** Groups shown in the pane: scan groups, then other copies. */
+const ADMIN_BADGE = 'Needs administrator password';
+const ADMIN_UNAVAILABLE =
+  'Administrator tools are not available in this build, so this item cannot be removed.';
+
+/**
+ * Groups shown in the pane: scan groups, a "System" group for leftovers that
+ * need administrator access (a bundle that does stays in its own group), then
+ * other copies.
+ */
 function groupsOf(scan) {
-  const groups = scan.groups.map((g) => ({ title: CATEGORY_LABEL[g.category], items: g.items }));
+  const groups = [];
+  const system = [];
+  for (const g of scan.groups) {
+    const isSystem = (i) => i.requires_admin && g.category !== 'app_bundle';
+    system.push(...g.items.filter(isSystem));
+    const rest = g.items.filter((i) => !isSystem(i));
+    if (rest.length || !g.items.length) groups.push({ title: CATEGORY_LABEL[g.category], items: rest });
+  }
+  if (system.length) groups.push({ title: 'System', items: system });
   if (scan.other_copies.length) groups.push({ title: 'Other copies', items: scan.other_copies });
   return groups;
+}
+
+/** Without the helper, administrator items cannot be removed, so none stays checked. */
+function enforceAdminAvailability(scan) {
+  if (state.adminAvailable) return;
+  for (const item of allItems(scan)) {
+    if (item.requires_admin) item.checked = false;
+  }
+}
+
+/** Re-renders keeping the scroll position and focus (receipts arrived or were ticked). */
+export function refreshDetail() {
+  const top = $('.detail-scroll')?.scrollTop ?? 0;
+  const key = document.activeElement?.getAttribute?.('data-key');
+  renderDetail();
+  const scroll = $('.detail-scroll');
+  if (scroll) scroll.scrollTop = top;
+  if (key) $(`[data-key="${CSS.escape(key)}"]`)?.focus();
 }
 
 const allItems = (scan) => groupsOf(scan).flatMap((g) => g.items);
@@ -49,6 +83,7 @@ export function renderDetail() {
   const detail = $('#detail');
   clear(detail);
   if (!scan) return showPlaceholder('Select an app to see what it leaves behind.');
+  enforceAdminAvailability(scan);
   const { app } = scan;
 
   const scroll = h('div', { class: 'detail-scroll' });
@@ -77,6 +112,7 @@ export function renderDetail() {
   if (scan.inaccessible.length) scroll.append(inaccessibleNotice(scan.inaccessible));
   if (!app.is_apple) scroll.append(presetBar());
   for (const group of groupsOf(scan)) scroll.append(groupView(group));
+  if (!app.is_apple && state.receipts.length) scroll.append(receiptsView());
 
   detail.append(scroll, actionBar());
 }
@@ -146,8 +182,62 @@ async function applyPreset(preset) {
   }
 }
 
+/** Installer receipts; forgetting one is opt-in and needs the administrator password. */
+function receiptsView() {
+  const unavailable = !state.adminAvailable;
+  return h(
+    'section',
+    { class: 'group', 'aria-label': 'Installer receipts' },
+    h(
+      'div',
+      { class: 'group-head' },
+      h('h3', {}, 'Installer receipts'),
+      h('span', { class: 'dim' }, plural(state.receipts.length, 'receipt')),
+    ),
+    h(
+      'p',
+      { class: 'dim receipt-note' },
+      'Removes the installer record. Files listed by the receipt are not deleted by this step.',
+    ),
+    state.receipts.map((r) => {
+      const details = [
+        r.version && `Version ${r.version}`,
+        r.install_location && `Installs to ${r.install_location}`,
+        r.files_count != null && plural(r.files_count, 'file'),
+      ].filter(Boolean).join(' · ');
+      return h(
+        'div',
+        { class: 'item' },
+        h('input', {
+          type: 'checkbox',
+          class: 'lead',
+          checked: state.forgetReceipts.has(r.pkg_id),
+          disabled: unavailable,
+          title: unavailable ? ADMIN_UNAVAILABLE : null,
+          id: `receipt-${r.pkg_id}`,
+          'data-key': `receipt:${r.pkg_id}`,
+          'aria-label': `Forget receipt ${r.pkg_id}`,
+          onchange: (e) => {
+            if (e.target.checked) state.forgetReceipts.add(r.pkg_id);
+            else state.forgetReceipts.delete(r.pkg_id);
+            refreshDetail();
+          },
+        }),
+        h(
+          'div',
+          {},
+          h('div', { class: 'name' }, r.pkg_id),
+          details && h('div', { class: 'reason' }, details),
+          h('span', { class: 'badge conf-medium' }, ADMIN_BADGE),
+        ),
+        h('label', { class: 'dim receipt-label', for: `receipt-${r.pkg_id}` }, 'Forget receipt'),
+      );
+    }),
+  );
+}
+
 function groupView(group) {
-  const selectable = group.items.filter((i) => !i.refused);
+  const selectable = group.items.filter((i) => !i.refused && !(i.requires_admin && !state.adminAvailable));
   const checkedCount = selectable.filter((i) => i.checked).length;
   const total = group.items.reduce((sum, i) => sum + i.size, 0);
 
@@ -185,6 +275,8 @@ function itemView(item) {
         type: 'checkbox',
         class: 'lead',
         checked: item.checked,
+        disabled: item.requires_admin && !state.adminAvailable,
+        title: item.requires_admin && !state.adminAvailable ? ADMIN_UNAVAILABLE : null,
         'data-key': item.path,
         'aria-label': `${name}, ${item.path}, ${formatBytes(item.size)}`,
         onchange: (e) => {
@@ -202,6 +294,15 @@ function itemView(item) {
       h('div', { class: 'name' }, name),
       h('div', { class: 'path' }, item.path),
       h('div', { class: 'reason' }, item.refused ?? item.reason),
+      item.requires_admin && !item.refused && h(
+        'span',
+        {
+          class: 'badge conf-medium',
+          title: state.adminAvailable ? null : ADMIN_UNAVAILABLE,
+        },
+        h('span', { 'aria-hidden': 'true' }, '🔒 '),
+        ADMIN_BADGE,
+      ),
     ),
     h('span', { class: 'size' }, formatBytes(item.size)),
     h(

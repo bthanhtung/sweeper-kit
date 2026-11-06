@@ -71,9 +71,24 @@ export async function startUninstall(scan, onDone) {
   }
 }
 
+/** Receipt ids to forget: only those still listed for the app. */
+function receiptsToForget() {
+  const known = new Set(state.receipts.map((r) => r.pkg_id));
+  return [...state.forgetReceipts].filter((id) => known.has(id));
+}
+
 function confirmSheet(scan, plan, onDone) {
   const permanent = state.settings.delete_immediately;
   const action = permanent ? 'Delete permanently' : 'Move to Trash';
+  const adminPaths = new Set(
+    [...scan.groups.flatMap((g) => g.items), ...scan.other_copies]
+      .filter((i) => i.requires_admin)
+      .map((i) => i.path),
+  );
+  const userItems = plan.items.filter((i) => !adminPaths.has(i.path));
+  const adminItems = plan.items.filter((i) => adminPaths.has(i.path));
+  const forget = receiptsToForget();
+  const itemRow = (i) => h('li', {}, `${i.path} — ${formatBytes(i.size)}`);
   show(
     body(
       title(`Uninstall ${scan.app.name}?`),
@@ -83,13 +98,21 @@ function confirmSheet(scan, plan, onDone) {
         `${plural(plan.items.length, 'item')} · ${formatBytes(plan.total_size)}. ` +
           (permanent
             ? 'These items will be deleted permanently and cannot be restored.'
-            : 'These items will be moved to the Trash and can be restored.'),
+            : 'These items will be moved to the Trash and can be restored.') +
+          (adminItems.length
+            ? ' System items are moved to a protected staging folder instead and can be restored from History.'
+            : ''),
       ),
-      h(
-        'ul',
-        { class: 'sheet-list', 'aria-label': 'Items to remove' },
-        plan.items.map((i) => h('li', {}, `${i.path} — ${formatBytes(i.size)}`)),
-      ),
+      userItems.length > 0 &&
+        h('ul', { class: 'sheet-list', 'aria-label': 'Items to remove' }, userItems.map(itemRow)),
+      adminItems.length > 0 && [
+        h('h3', { class: 'sheet-section' }, 'Requires administrator password (one prompt)'),
+        h('ul', { class: 'sheet-list', 'aria-label': 'Items that need the administrator password' }, adminItems.map(itemRow)),
+      ],
+      forget.length > 0 && [
+        h('h3', { class: 'sheet-section' }, 'Installer receipts to forget (same prompt)'),
+        h('ul', { class: 'sheet-list', 'aria-label': 'Receipts to forget' }, forget.map((id) => h('li', {}, id))),
+      ],
     ),
     foot(
       button('Cancel', { onclick: close, autofocus: true }),
@@ -110,7 +133,7 @@ async function run(scan, plan, onDone) {
     announce(`${done} of ${total}: ${path}`);
   });
   try {
-    const report = await invoke('uninstall', { scan });
+    const report = await invoke('uninstall', { scan, forgetReceipts: receiptsToForget() });
     busy = false;
     reportSheet(scan, report, onDone);
   } catch (e) {
@@ -147,6 +170,7 @@ function reportSheet(scan, report, onDone) {
         'ul',
         { class: 'sheet-list', 'aria-label': 'Steps' },
         report.steps.map((s) => stepRow(s.ok, s.detail ? `${s.name} — ${s.detail}` : s.name)),
+        report.admin && stepRow(report.admin.ok, report.admin.detail ? `${report.admin.name} — ${report.admin.detail}` : report.admin.name),
         failed.map(([path, why]) => stepRow(false, `${path} — ${why}`)),
         warnings.map((w) => stepRow(false, w)),
       ),
@@ -165,7 +189,7 @@ function reportSheet(scan, report, onDone) {
         h(
           'p',
           { class: 'dim' },
-          'Items are in the Trash. ',
+          'Items are in the Trash, or the protected staging folder for system items. ',
           h(
             'button',
             {
