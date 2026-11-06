@@ -40,6 +40,44 @@ function list(label, values, remove) {
   );
 }
 
+const MAX_SIZE_MB = 1_000_000;
+const AGE_RANGE = [1, 3650];
+
+/** A labelled whole-number field that saves on change and explains bad input. */
+function numberField({ id, label, hint, value, min, max, store }) {
+  const message = h('p', { id: `${id}-message`, class: 'warn', role: 'alert' });
+  const input = h('input', {
+    type: 'number',
+    id,
+    value: String(value),
+    min,
+    max,
+    step: 1,
+    inputmode: 'numeric',
+    'aria-describedby': `${id}-hint ${id}-message`,
+    onchange: () => {
+      const text = input.value.trim();
+      const number = Number(text);
+      if (text === '' || !Number.isInteger(number) || number < min || number > max) {
+        message.textContent = `Enter a whole number from ${min} to ${max}.`;
+        input.setAttribute('aria-invalid', 'true');
+        return;
+      }
+      message.textContent = '';
+      input.removeAttribute('aria-invalid');
+      store(number);
+    },
+  });
+  return h(
+    'div',
+    { class: 'field' },
+    h('label', { for: id }, label),
+    input,
+    h('p', { id: `${id}-hint` }, hint),
+    message,
+  );
+}
+
 export async function renderSettings() {
   const view = $('#view-settings');
   const s = state.settings;
@@ -97,6 +135,30 @@ export async function renderSettings() {
         list('Protected items', s.protected, (value) =>
           save({ ...s, protected: s.protected.filter((p) => p !== value) })),
         h('div', { class: 'row' }, entry, h('button', { type: 'button', class: 'btn', onclick: addProtected }, 'Add')),
+      ),
+
+      h(
+        'section',
+        {},
+        h('h3', {}, 'Cleaner'),
+        numberField({
+          id: 'min-item-size',
+          label: 'Minimum item size (MB)',
+          hint: 'The cleaner hides items smaller than this. 0 shows everything.',
+          value: s.min_item_size_mb,
+          min: 0,
+          max: MAX_SIZE_MB,
+          store: (value) => save({ ...s, min_item_size_mb: value }),
+        }),
+        numberField({
+          id: 'downloads-age',
+          label: 'Old downloads: older than N days',
+          hint: 'Files in Downloads not modified for this many days are offered by the cleaner, never pre-selected.',
+          value: s.downloads_age_days,
+          min: AGE_RANGE[0],
+          max: AGE_RANGE[1],
+          store: (value) => save({ ...s, downloads_age_days: value }),
+        }),
       ),
 
       h(

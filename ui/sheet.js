@@ -9,26 +9,31 @@ const sheet = $('#sheet');
 /** While true the sheet cannot be dismissed (work in progress). */
 let busy = false;
 
+/** Marks work in progress: the sheet then ignores Esc. */
+export function setBusy(value) {
+  busy = value;
+}
+
 sheet.addEventListener('cancel', (e) => {
   if (busy) e.preventDefault();
 });
 
-function show(...children) {
+export function show(...children) {
   clear(sheet);
   sheet.append(...children);
   if (!sheet.open) sheet.showModal();
 }
 
-function close() {
+export function close() {
   busy = false;
   if (sheet.open) sheet.close();
 }
 
-const body = (...children) => h('div', { class: 'sheet-body' }, ...children);
-const foot = (...buttons) => h('div', { class: 'sheet-foot' }, ...buttons);
-const title = (text) => h('h2', { id: 'sheet-title' }, text);
+export const body = (...children) => h('div', { class: 'sheet-body' }, ...children);
+export const foot = (...buttons) => h('div', { class: 'sheet-foot' }, ...buttons);
+export const title = (text) => h('h2', { id: 'sheet-title' }, text);
 
-function button(label, { kind = '', onclick, autofocus = false } = {}) {
+export function button(label, { kind = '', onclick, autofocus = false } = {}) {
   return h('button', { type: 'button', class: `btn ${kind}`.trim(), onclick, autofocus }, label);
 }
 
@@ -117,7 +122,7 @@ async function run(scan, plan, onDone) {
   }
 }
 
-function stepRow(ok, text) {
+export function stepRow(ok, text) {
   return h(
     'li',
     { class: 'step' },

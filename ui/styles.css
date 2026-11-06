@@ -352,6 +352,46 @@ progress { width: 100%; height: 8px; accent-color: var(--accent); }
 .step .ok { color: var(--ok); }
 .step .bad { color: var(--warning); }
 
+/* Cleaner */
+.cleaner { display: flex; flex-direction: column; height: 100%; }
+.cleaner-head { display: flex; align-items: center; gap: 12px; padding: 40px 24px 8px; }
+.cleaner-head h2 { margin: 0; flex: 1; font-size: 20px; font-weight: 600; }
+.cleaner .detail-scroll { padding-top: 8px; }
+.cleaner .detail-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.cleaner progress { width: 220px; }
+svg.nav-glyph { display: block; }
+.disclosure {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  font-weight: 600;
+}
+.chevron { width: 12px; color: var(--text-2); }
+.clean-list { margin: 0; padding: 0; list-style: none; }
+.badge.danger { background: var(--danger-bg); color: var(--danger); margin-right: 6px; }
+.item .badge { margin-top: 2px; }
+.item .path.command { display: block; }
+.sheet-section { margin: 12px 0 2px; font-size: 13px; }
+.sheet-body p.warn, .sheet-section.warn { color: var(--danger); }
+.settings .field { margin-bottom: 14px; }
+.settings .field label { display: block; margin-bottom: 4px; font-weight: 500; }
+.settings .field p { margin: 4px 0 0; }
+.settings p.warn { color: var(--danger); }
+.settings .field p.warn:empty { display: none; }
+.settings input[type="number"] {
+  width: 120px;
+  padding: 4px 8px;
+  border: 1px solid var(--separator);
+  border-radius: 6px;
+  background: var(--bg);
+}
+.settings input[aria-invalid="true"] { border-color: var(--danger); }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
 }

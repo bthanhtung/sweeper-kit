@@ -38,6 +38,13 @@ export function hueOf(text) {
   return hash % 360;
 }
 
+/** Command line each cleaner action runs (the tool is looked up at fixed system paths). */
+export const ACTION_COMMAND = {
+  simctl_delete_unavailable: 'xcrun simctl delete unavailable',
+  brew_cleanup: 'brew cleanup -s',
+  docker_prune: 'docker system prune -f',
+};
+
 export const SOURCE_LABEL = { app_store: 'App Store', homebrew: 'Homebrew', other: 'Other' };
 
 export const CATEGORY_LABEL = {
