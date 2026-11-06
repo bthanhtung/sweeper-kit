@@ -15,6 +15,13 @@
     { "id": "saved_application_state", "category": "cookies_state", "base": "~/Library/Saved Application State", "match": "id", "suffixes": [".savedState"], "default_checked": true },
     { "id": "logs", "category": "logs", "base": "~/Library/Logs", "match": "id_or_name", "suffixes": [""], "default_checked": true },
     { "id": "diagnostic_reports", "category": "logs", "base": "~/Library/Logs/DiagnosticReports", "match": "name_prefix", "suffixes": [""], "default_checked": true },
-    { "id": "launch_agents", "category": "background_items", "base": "~/Library/LaunchAgents", "match": "contains_id", "suffixes": [".plist"], "default_checked": true }
+    { "id": "launch_agents", "category": "background_items", "base": "~/Library/LaunchAgents", "match": "contains_id", "suffixes": [".plist"], "default_checked": true },
+    { "id": "system_application_support", "category": "app_data", "scope": "system", "base": "/Library/Application Support", "match": "id_or_name", "suffixes": [""], "default_checked": true },
+    { "id": "system_caches", "category": "caches", "scope": "system", "base": "/Library/Caches", "match": "id", "suffixes": [""], "default_checked": true },
+    { "id": "system_preferences", "category": "preferences", "scope": "system", "base": "/Library/Preferences", "match": "id_prefix", "suffixes": [".plist"], "default_checked": true },
+    { "id": "system_launch_agents", "category": "background_items", "scope": "system", "base": "/Library/LaunchAgents", "match": "contains_id", "suffixes": [".plist"], "default_checked": true },
+    { "id": "system_launch_daemons", "category": "background_items", "scope": "system", "base": "/Library/LaunchDaemons", "match": "contains_id", "suffixes": [".plist"], "default_checked": true },
+    { "id": "system_privileged_helper_tools", "category": "background_items", "scope": "system", "base": "/Library/PrivilegedHelperTools", "match": "contains_id", "suffixes": [""], "default_checked": true },
+    { "id": "system_logs", "category": "logs", "scope": "system", "base": "/Library/Logs", "match": "id_or_name", "suffixes": [""], "default_checked": true }
   ]
 }

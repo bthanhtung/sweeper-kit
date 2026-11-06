@@ -7,14 +7,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::admin::bundle_needs_admin;
 use crate::catalog::AppInfo;
 use crate::env::Env;
 use crate::fsutil::tree_size;
-use crate::path_policy::PathPolicy;
-use crate::rules::{AppIdent, Category, Location, MatchBy, RuleSet};
+use crate::path_policy::{PathPolicy, SystemPolicy};
+use crate::rules::{AppIdent, Category, Location, MatchBy, RuleSet, Scope};
 use crate::system::Spotlight;
 
 const APPLE_REASON: &str = "Apple app — read only";
+const SYSTEM_NAME_NOTE: &str = " matches the app name only — not selected automatically";
 const TEAM_REASON: &str = "team container — may be shared with other apps from this developer";
 
 /// One removable file or folder.
@@ -28,9 +30,14 @@ pub struct Item {
     pub reason: String,
     /// Set when the path policy forbids removal; such items are never checked.
     pub refused: Option<String>,
-    /// Team-wide entry that other apps from the same developer may need; never
-    /// checked by a preset.
+    /// Entry that may belong to something else: a team-wide entry that other
+    /// apps from the same developer may need, or a system-scope entry matched
+    /// by app name only. Never checked by a preset.
     pub shared: bool,
+    /// Removing the item needs administrator access: it lives in `/Library`,
+    /// or its bundle sits where the current user cannot write.
+    #[serde(default)]
+    pub requires_admin: bool,
 }
 
 /// Items of one category, ordered by path.
@@ -110,6 +117,9 @@ struct Candidate {
     reason: String,
     default_checked: bool,
     shared: bool,
+    /// Found in a system-scope location.
+    system: bool,
+    requires_admin: bool,
 }
 
 /// Scans the Library locations described by a [`RuleSet`].
@@ -117,6 +127,7 @@ pub struct LeftoverScanner<'a> {
     env: &'a Env,
     rules: &'a RuleSet,
     policy: &'a PathPolicy,
+    system_policy: SystemPolicy,
     spotlight: &'a dyn Spotlight,
 }
 
@@ -131,8 +142,16 @@ impl<'a> LeftoverScanner<'a> {
             env,
             rules,
             policy,
+            system_policy: SystemPolicy::new(env, &[]),
             spotlight,
         }
+    }
+
+    /// Uses `policy` for system-scope items instead of the default one, which
+    /// has no protected paths or bundle identifiers.
+    pub fn with_system_policy(mut self, policy: SystemPolicy) -> Self {
+        self.system_policy = policy;
+        self
     }
 
     /// Finds leftovers of `app`. `installed` is used to avoid claiming files
@@ -155,6 +174,8 @@ impl<'a> LeftoverScanner<'a> {
                 reason: "Application bundle".into(),
                 default_checked: true,
                 shared: false,
+                system: false,
+                requires_admin: bundle_needs_admin(&app.path),
             });
         }
 
@@ -212,7 +233,8 @@ impl<'a> LeftoverScanner<'a> {
         out: &mut Vec<Candidate>,
         inaccessible: &mut Vec<(PathBuf, String)>,
     ) {
-        let base = loc.resolve_base(&self.env.home);
+        let system = loc.scope == Scope::System;
+        let base = loc.resolve(self.env);
         let entries = match std::fs::read_dir(&base) {
             Ok(e) => e,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return,
@@ -232,6 +254,9 @@ impl<'a> LeftoverScanner<'a> {
             }
             let (reason, shared) = match by {
                 MatchBy::Id => (format!("Matches bundle identifier in {}", loc.base), false),
+                // Machine-wide folders are shared by every user, so a match
+                // on the name alone is never selected automatically.
+                MatchBy::Name if system => (format!("{}{SYSTEM_NAME_NOTE}", loc.base), true),
                 MatchBy::Name => (format!("Matches app name in {}", loc.base), false),
                 MatchBy::Team => (TEAM_REASON.to_string(), true),
             };
@@ -241,6 +266,8 @@ impl<'a> LeftoverScanner<'a> {
                 reason,
                 default_checked: loc.default_checked && !shared,
                 shared,
+                system,
+                requires_admin: system,
             });
         }
     }
@@ -258,7 +285,7 @@ impl<'a> LeftoverScanner<'a> {
                 let refused = if is_apple {
                     Some(APPLE_REASON.to_string())
                 } else {
-                    self.policy.check(&c.path).err().map(|e| e.to_string())
+                    self.refusal(&c)
                 };
                 let size = tree_size(&c.path, cancel).unwrap_or(0);
                 Item {
@@ -269,9 +296,32 @@ impl<'a> LeftoverScanner<'a> {
                     reason: c.reason,
                     refused,
                     shared: c.shared,
+                    requires_admin: c.requires_admin,
                 }
             })
             .collect()
+    }
+
+    /// Why the policy forbids removing `c`. System-scope items, and bundles
+    /// that need administrator access, must pass [`SystemPolicy`] because the
+    /// privileged helper applies it again before touching them.
+    fn refusal(&self, c: &Candidate) -> Option<String> {
+        if c.system {
+            return self
+                .system_policy
+                .check(&c.path)
+                .err()
+                .map(|e| e.to_string());
+        }
+        let user = self.policy.check(&c.path).err();
+        if user.is_none() && c.requires_admin {
+            return self
+                .system_policy
+                .check(&c.path)
+                .err()
+                .map(|e| e.to_string());
+        }
+        user.map(|e| e.to_string())
     }
 
     fn other_copies(&self, app: &AppInfo, cancel: &AtomicBool) -> Vec<Item> {
@@ -288,11 +338,13 @@ impl<'a> LeftoverScanner<'a> {
         let candidates = paths
             .into_iter()
             .map(|path| Candidate {
+                requires_admin: bundle_needs_admin(&path),
                 path,
                 category: Category::AppBundle,
                 reason: "Another copy of this app".into(),
                 default_checked: false,
                 shared: false,
+                system: false,
             })
             .collect();
         self.build_items(candidates, app.is_apple, cancel)

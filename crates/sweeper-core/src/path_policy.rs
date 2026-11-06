@@ -322,6 +322,292 @@ impl PathPolicy {
     }
 }
 
+/// `/Library` subfolders whose children may be removed with administrator
+/// access.
+pub(crate) const SYSTEM_LIBRARY_ROOT_DIRS: [&str; 7] = [
+    "Application Support",
+    "Caches",
+    "Preferences",
+    "LaunchAgents",
+    "LaunchDaemons",
+    "PrivilegedHelperTools",
+    "Logs",
+];
+
+/// Directories below the system root that hold `*.app` bundles the helper may remove.
+const SYSTEM_APP_DIRS: [&str; 2] = ["Applications", "Applications/Utilities"];
+
+/// Where the helper keeps items moved out of `/Library` until the user
+/// confirms they are not needed (relative to the system root).
+pub(crate) const STAGING_REL: &str = "Library/Application Support/Sweeper Kit/Staging";
+
+/// Decides which system-scope paths the privileged helper may modify. It is
+/// deliberately much narrower than [`PathPolicy`]: only children of a few
+/// `/Library` folders and direct `*.app` children of `/Applications` pass.
+///
+/// macOS file systems are case-insensitive by default, so every deny rule is
+/// compared case-insensitively.
+#[derive(Debug, Clone)]
+pub struct SystemPolicy {
+    system_root: PathBuf,
+    roots: Vec<PathBuf>,
+    raw_roots: Vec<PathBuf>,
+    app_dirs: Vec<PathBuf>,
+    denied: Vec<(PathBuf, &'static str)>,
+    staging: PathBuf,
+    launch_daemons: PathBuf,
+    launch_agents: PathBuf,
+    protected_paths: Vec<PathBuf>,
+    protected_ids: HashSet<String>,
+    self_id: String,
+}
+
+impl SystemPolicy {
+    /// `protected` mixes absolute paths and bundle identifiers, like
+    /// [`PathPolicy::new`]; `~/` entries are ignored because they never lie in
+    /// system scope.
+    pub fn new(env: &Env, protected: &[String]) -> SystemPolicy {
+        let system_root = canonicalize_lenient(&env.system_root);
+        let lib = system_root.join("Library");
+        let raw_lib = env.system_root.join("Library");
+        let mut roots = Vec::new();
+        let mut raw_roots = Vec::new();
+        for sub in SYSTEM_LIBRARY_ROOT_DIRS {
+            roots.push(lib.join(sub));
+            raw_roots.push(raw_lib.join(sub));
+        }
+        let mut app_dirs = Vec::new();
+        for sub in SYSTEM_APP_DIRS {
+            app_dirs.push(system_root.join(sub));
+            raw_roots.push(env.system_root.join(sub));
+        }
+        let staging = system_root.join(STAGING_REL);
+        let denied = vec![
+            (lib.join("Apple"), "Apple files"),
+            (lib.join("Application Support/Apple"), "Apple files"),
+            (
+                lib.join("Application Support/Sweeper Kit"),
+                "Sweeper Kit's own data",
+            ),
+            (lib.join("Logs/Sweeper Kit"), "Sweeper Kit's own data"),
+            (
+                canonicalize_lenient(&env.data_dir),
+                "Sweeper Kit's own data",
+            ),
+        ];
+        let mut protected_paths = Vec::new();
+        let mut protected_ids = HashSet::new();
+        for entry in protected {
+            if entry.starts_with('/') {
+                protected_paths.push(PathBuf::from(entry));
+                protected_paths.push(canonicalize_lenient(Path::new(entry)));
+            } else if !entry.is_empty() && !entry.starts_with("~/") {
+                protected_ids.insert(entry.clone());
+            }
+        }
+        SystemPolicy {
+            launch_daemons: lib.join("LaunchDaemons"),
+            launch_agents: lib.join("LaunchAgents"),
+            system_root,
+            roots,
+            raw_roots,
+            app_dirs,
+            denied,
+            staging,
+            protected_paths,
+            protected_ids,
+            self_id: env.self_bundle_id.clone(),
+        }
+    }
+
+    /// Canonical system root (`/` on a real Mac).
+    pub fn system_root(&self) -> &Path {
+        &self.system_root
+    }
+
+    /// Canonical `<root>/Library/Application Support/Sweeper Kit/Staging`.
+    pub fn staging_dir(&self) -> &Path {
+        &self.staging
+    }
+
+    /// Canonical `<root>/Library/LaunchDaemons`.
+    pub fn launch_daemons_dir(&self) -> &Path {
+        &self.launch_daemons
+    }
+
+    /// Canonical `<root>/Library/LaunchAgents`.
+    pub fn launch_agents_dir(&self) -> &Path {
+        &self.launch_agents
+    }
+
+    /// Validates an existing path and returns its canonical form. Symlinks
+    /// are never followed for the final component, but their target must also
+    /// be allowed.
+    pub fn check(&self, path: &Path) -> Result<PathBuf, PolicyError> {
+        let (parent, name) = split_absolute(path)?;
+        let canonical = std::fs::canonicalize(parent).map_err(io_err)?.join(name);
+        let meta = std::fs::symlink_metadata(&canonical).map_err(io_err)?;
+        self.check_in_context(&canonical, parent)?;
+        if meta.file_type().is_symlink() {
+            let target =
+                std::fs::canonicalize(&canonical).map_err(|_| PolicyError::SymlinkEscape)?;
+            self.check_resolved(&target)
+                .map_err(|_| PolicyError::SymlinkEscape)?;
+        }
+        Ok(canonical)
+    }
+
+    /// Like [`SystemPolicy::check`] for a path that does not have to exist
+    /// yet, such as the destination of a restore. Only the parent is
+    /// resolved.
+    pub fn check_destination(&self, path: &Path) -> Result<PathBuf, PolicyError> {
+        let (parent, name) = split_absolute(path)?;
+        let canonical = canonicalize_lenient(parent).join(name);
+        self.check_in_context(&canonical, parent)?;
+        Ok(canonical)
+    }
+
+    /// Validates a path inside the staging directory, which must be exactly
+    /// `<staging>/<batch>/<item>`. The path need not exist.
+    pub fn check_staging(&self, path: &Path) -> Result<PathBuf, PolicyError> {
+        let (parent, name) = split_absolute(path)?;
+        let canonical = canonicalize_lenient(parent).join(name);
+        let depth = canonical
+            .strip_prefix(&self.staging)
+            .map(|rel| rel.components().count())
+            .unwrap_or(0);
+        if depth == 2 {
+            Ok(canonical)
+        } else {
+            Err(PolicyError::OutsideAllowedRoots)
+        }
+    }
+
+    /// Refuses bundle identifiers of Apple, Sweeper Kit itself or protected apps.
+    pub fn check_bundle_id(&self, id: &str) -> Result<(), PolicyError> {
+        if id == self.self_id {
+            return Err(PolicyError::Denied("Sweeper Kit itself".into()));
+        }
+        if id.to_ascii_lowercase().starts_with("com.apple.") {
+            return Err(PolicyError::Denied("Apple app".into()));
+        }
+        if self.protected_ids.contains(id) {
+            return Err(PolicyError::Protected);
+        }
+        Ok(())
+    }
+
+    fn check_in_context(&self, canonical: &Path, raw_parent: &Path) -> Result<(), PolicyError> {
+        match self.check_resolved(canonical) {
+            Err(PolicyError::OutsideAllowedRoots) if self.has_escaping_ancestor(raw_parent) => {
+                Err(PolicyError::SymlinkEscape)
+            }
+            other => other,
+        }
+    }
+
+    /// True if an ancestor lexically inside an allowed root is a symlink.
+    fn has_escaping_ancestor(&self, parent: &Path) -> bool {
+        parent.ancestors().any(|a| {
+            self.raw_roots.iter().any(|r| a.starts_with(r))
+                && std::fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink())
+        })
+    }
+
+    fn check_resolved(&self, canonical: &Path) -> Result<(), PolicyError> {
+        self.check_denied(canonical)?;
+        let in_root = self
+            .roots
+            .iter()
+            .any(|r| canonical.starts_with(r) && canonical != r);
+        let app_child = canonical
+            .parent()
+            .is_some_and(|p| self.app_dirs.iter().any(|d| d == p))
+            && canonical
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("app"));
+        if !in_root && !app_child {
+            return Err(PolicyError::OutsideAllowedRoots);
+        }
+        if self
+            .protected_paths
+            .iter()
+            .any(|p| canonical.starts_with(p))
+        {
+            return Err(PolicyError::Protected);
+        }
+        self.check_bundles(canonical)
+    }
+
+    fn check_denied(&self, canonical: &Path) -> Result<(), PolicyError> {
+        for (dir, why) in &self.denied {
+            if starts_with_ci(canonical, dir) {
+                return Err(PolicyError::Denied(format!("{} ({why})", dir.display())));
+            }
+        }
+        let relative = canonical
+            .strip_prefix(&self.system_root)
+            .unwrap_or(canonical);
+        let apple = relative.components().any(|c| {
+            c.as_os_str()
+                .to_str()
+                .map_or(true, |s| s.to_ascii_lowercase().starts_with("com.apple."))
+        });
+        if apple {
+            return Err(PolicyError::Denied("Apple item".into()));
+        }
+        Ok(())
+    }
+
+    /// Refuses `.app` bundles of Apple, Sweeper Kit itself or protected ids.
+    fn check_bundles(&self, canonical: &Path) -> Result<(), PolicyError> {
+        for a in canonical.ancestors() {
+            if self
+                .roots
+                .iter()
+                .chain(self.app_dirs.iter())
+                .any(|r| r == a)
+            {
+                break;
+            }
+            if !a.extension().is_some_and(|e| e.eq_ignore_ascii_case("app")) {
+                continue;
+            }
+            if let Some(id) = read_bundle_id(a) {
+                self.check_bundle_id(&id)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Splits an absolute path without `.`/`..` into parent and final component.
+fn split_absolute(path: &Path) -> Result<(&Path, &OsStr), PolicyError> {
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(PolicyError::OutsideAllowedRoots);
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(p), Some(n)) => Ok((p, n)),
+        _ => Err(PolicyError::OutsideAllowedRoots),
+    }
+}
+
+/// `starts_with` on whole components, ignoring ASCII case.
+fn starts_with_ci(path: &Path, base: &Path) -> bool {
+    let mut p = path.components();
+    base.components().all(|b| {
+        p.next().is_some_and(|c| {
+            c.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+        })
+    })
+}
+
 fn is_photos_library(path: &Path) -> bool {
     path.components().any(|c| {
         c.as_os_str()

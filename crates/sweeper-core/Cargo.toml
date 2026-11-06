@@ -18,6 +18,10 @@ thiserror.workspace = true
 rayon.workspace = true
 tempfile = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# access(2) for the "can the current user write here" check and geteuid(2).
+libc = "0.2"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-foundation.workspace = true

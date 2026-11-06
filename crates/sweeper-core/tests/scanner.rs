@@ -348,3 +348,196 @@ fn scanning_2000_library_entries_is_fast() {
     assert!(elapsed < Duration::from_secs(3), "scan took {elapsed:?}");
     assert_eq!(leftover_paths(&result).len(), 1);
 }
+
+// ------------------------------------------------------------ system scope
+
+mod system_scope {
+    use std::fs;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use sweeper_core::testing::write_file;
+    use sweeper_core::{Item, ScanResult};
+
+    /// Puts a file below the fake system root.
+    fn sys_file(fx: &Fixture, rel: &str) -> PathBuf {
+        let p = fx.sys(rel);
+        write_file(&p, 100);
+        p
+    }
+
+    fn parent(p: &Path) -> PathBuf {
+        p.parent().unwrap().to_path_buf()
+    }
+
+    fn item<'a>(scan: &'a ScanResult, path: &Path) -> &'a Item {
+        scan.items()
+            .find(|i| i.path == path)
+            .unwrap_or_else(|| panic!("{} not found", path.display()))
+    }
+
+    #[test]
+    fn finds_system_leftovers_and_flags_them_as_needing_admin() {
+        let fx = Fixture::new();
+        fx.install("Foo", FOO, "1.0");
+        let daemon = sys_file(&fx, "Library/LaunchDaemons/com.foo.app.helper.plist");
+        let agent = sys_file(&fx, "Library/LaunchAgents/com.foo.app.plist");
+        let tool = sys_file(&fx, "Library/PrivilegedHelperTools/com.foo.app.helper");
+        let support = parent(&sys_file(
+            &fx,
+            "Library/Application Support/com.foo.app/data.bin",
+        ));
+        let cache = parent(&sys_file(&fx, "Library/Caches/com.foo.app/c.bin"));
+        let prefs = sys_file(&fx, "Library/Preferences/com.foo.app.plist");
+        let logs = parent(&sys_file(&fx, "Library/Logs/com.foo.app/x.log"));
+        let user = touch(&fx, "Library/Preferences/com.foo.app.plist");
+
+        let scan = scan(&fx, FOO);
+        for (path, category) in [
+            (&daemon, Category::BackgroundItems),
+            (&agent, Category::BackgroundItems),
+            (&tool, Category::BackgroundItems),
+            (&support, Category::AppData),
+            (&cache, Category::Caches),
+            (&prefs, Category::Preferences),
+            (&logs, Category::Logs),
+        ] {
+            let i = item(&scan, path);
+            assert!(i.requires_admin, "{}", path.display());
+            assert!(i.checked && i.refused.is_none(), "{i:?}");
+            assert_eq!(i.category, category);
+        }
+        // User-scope items and the writable bundle need no administrator.
+        assert!(!item(&scan, &user).requires_admin);
+        assert!(!item(&scan, &scan.app.path).requires_admin);
+    }
+
+    #[test]
+    fn matches_only_this_app_not_sibling_ids_or_apple_items() {
+        let fx = Fixture::new();
+        fx.install("Foo", FOO, "1.0");
+        sys_file(
+            &fx,
+            "Library/LaunchDaemons/com.foo.application.helper.plist",
+        );
+        sys_file(&fx, "Library/LaunchDaemons/com.apple.foo.plist");
+        sys_file(&fx, "Library/Caches/com.bar.app/c.bin");
+        let scan = scan(&fx, FOO);
+        assert!(scan.items().all(|i| !i.requires_admin));
+    }
+
+    #[test]
+    fn name_matches_in_system_scope_are_never_preselected() {
+        let fx = Fixture::new();
+        fx.install("Foo", FOO, "1.0");
+        let by_name = parent(&sys_file(
+            &fx,
+            "Library/Application Support/Foo/settings.json",
+        ));
+        let by_id = parent(&sys_file(
+            &fx,
+            "Library/Application Support/com.foo.app/a.bin",
+        ));
+
+        let mut result = scan(&fx, FOO);
+        let named = item(&result, &by_name);
+        assert!(named.requires_admin && named.shared && !named.checked);
+        assert!(item(&result, &by_id).checked);
+
+        apply_preset(&mut result, Preset::Everything);
+        assert!(!item(&result, &by_name).checked);
+        assert!(item(&result, &by_id).checked);
+        apply_preset(&mut result, Preset::AppOnly);
+        assert!(!item(&result, &by_id).checked);
+    }
+
+    #[test]
+    fn system_items_the_policy_refuses_are_listed_unchecked() {
+        let fx = Fixture::new();
+        fx.install("Foo", FOO, "1.0");
+        let outside = outside_dir(&fx);
+        fs::create_dir_all(fx.sys("Library/Caches")).unwrap();
+        let link = fx.sys("Library/Caches/com.foo.app");
+        symlink(&outside, &link).unwrap();
+        let scan = scan(&fx, FOO);
+        let i = item(&scan, &link);
+        assert!(i.requires_admin && !i.checked);
+        assert!(i.refused.is_some());
+        assert!(outside.join("precious.txt").exists());
+    }
+
+    #[test]
+    fn protected_system_paths_are_refused_through_the_system_policy() {
+        let fx = Fixture::new();
+        fx.install("Foo", FOO, "1.0");
+        let daemon = sys_file(&fx, "Library/LaunchDaemons/com.foo.app.helper.plist");
+        let apps = installed(&fx);
+        let app = app_by_id(&apps, FOO);
+        let policy = PathPolicy::new(&fx.env, &[]);
+        let rules = RuleSet::bundled();
+        let spot = FakeSpotlight::default();
+        let strict = sweeper_core::SystemPolicy::new(&fx.env, &[daemon.display().to_string()]);
+        let scan = LeftoverScanner::new(&fx.env, &rules, &policy, &spot)
+            .with_system_policy(strict)
+            .scan(&app, &apps, &AtomicBool::new(false));
+        let i = item(&scan, &daemon);
+        assert!(i.refused.is_some() && !i.checked);
+    }
+
+    /// Restores permissions so the temporary directory can be cleaned up.
+    struct Unlock(PathBuf);
+
+    impl Drop for Unlock {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    fn bundle_in_an_unwritable_app_dir_needs_admin() {
+        if sweeper_core::is_root() {
+            return; // root can write anywhere
+        }
+        let mut fx = Fixture::new();
+        // A system-wide Applications folder, as on a real Mac.
+        fx.apps_dir = fx.sys("Applications");
+        fs::create_dir_all(&fx.apps_dir).unwrap();
+        fx.env.app_dirs = vec![fx.apps_dir.clone()];
+        let bundle = fx.install("Foo", FOO, "1.0");
+
+        let writable = scan(&fx, FOO);
+        assert!(!item(&writable, &bundle).requires_admin);
+
+        let _unlock = Unlock(fx.apps_dir.clone());
+        fs::set_permissions(&fx.apps_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let locked = scan(&fx, FOO);
+        let i = item(&locked, &bundle);
+        assert!(i.requires_admin);
+        assert!(i.checked && i.refused.is_none(), "{i:?}");
+    }
+
+    #[test]
+    fn unwritable_bundle_outside_the_system_applications_is_refused() {
+        if sweeper_core::is_root() {
+            return;
+        }
+        // The fixture's app dir is not <system root>/Applications, so the
+        // helper could never remove a bundle there: listed, not selectable.
+        let fx = Fixture::new();
+        let bundle = fx.install("Foo", FOO, "1.0");
+        let _unlock = Unlock(fx.apps_dir.clone());
+        fs::set_permissions(&fx.apps_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        let locked = scan(&fx, FOO);
+        let i = item(&locked, &bundle);
+        assert!(i.requires_admin);
+        assert!(!i.checked && i.refused.is_some());
+    }
+
+    #[test]
+    fn items_saved_without_the_new_field_load_as_not_requiring_admin() {
+        let json = r#"{"path":"/a","size":1,"checked":true,"category":"caches","reason":"r","refused":null,"shared":false}"#;
+        let item: Item = serde_json::from_str(json).unwrap();
+        assert!(!item.requires_admin);
+    }
+}

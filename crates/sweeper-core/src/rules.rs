@@ -1,9 +1,12 @@
-//! Data-driven description of where an app leaves files in `~/Library`.
+//! Data-driven description of where an app leaves files in `~/Library` and
+//! `/Library`.
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+use crate::env::Env;
 
 const BUNDLED: &str = include_str!("../../../rules/macos.json");
 const SUPPORTED_VERSION: u32 = 1;
@@ -41,12 +44,27 @@ pub enum MatchKind {
     ContainsId,
 }
 
+/// Whose files a [`Location`] lists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scope {
+    /// The current user's `~/Library`; removable without extra privileges.
+    #[default]
+    User,
+    /// The machine-wide `/Library`; removal needs administrator access.
+    System,
+}
+
 /// One place to look for leftovers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
     pub id: String,
     pub category: Category,
-    /// Directory to list, always starting with `~/Library/`.
+    /// `user` (default) or `system`.
+    #[serde(default)]
+    pub scope: Scope,
+    /// Directory to list: `~/Library/...` for user scope, `/Library/...` for
+    /// system scope.
     pub base: String,
     #[serde(rename = "match")]
     pub matcher: MatchKind,
@@ -136,10 +154,11 @@ impl RuleSet {
             if loc.id.is_empty() || !seen.insert(loc.id.as_str()) {
                 return Err(bad("id must be non-empty and unique"));
             }
-            let rest = loc
-                .base
-                .strip_prefix("~/Library/")
-                .ok_or_else(|| bad("base must start with ~/Library/"))?;
+            let (prefix, expected) = match loc.scope {
+                Scope::User => ("~/Library/", "base must start with ~/Library/"),
+                Scope::System => ("/Library/", "system base must start with /Library/"),
+            };
+            let rest = loc.base.strip_prefix(prefix).ok_or_else(|| bad(expected))?;
             if rest.is_empty()
                 || Path::new(rest)
                     .components()
@@ -162,9 +181,19 @@ impl RuleSet {
 }
 
 impl Location {
-    /// Absolute directory to list for the given home.
+    /// Absolute directory to list for the given home. Only meaningful for
+    /// user-scope locations; see [`Location::resolve`] for both scopes.
     pub fn resolve_base(&self, home: &Path) -> PathBuf {
         home.join(self.base.trim_start_matches("~/"))
+    }
+
+    /// Absolute directory to list: below the home for user scope, below
+    /// [`Env::system_root`] for system scope.
+    pub fn resolve(&self, env: &Env) -> PathBuf {
+        match self.scope {
+            Scope::User => self.resolve_base(&env.home),
+            Scope::System => env.system_root.join(self.base.trim_start_matches('/')),
+        }
     }
 
     /// Tests a directory entry name against this location's strategy.
@@ -280,6 +309,7 @@ mod tests {
         Location {
             id: "x".into(),
             category: Category::Caches,
+            scope: Scope::User,
             base: "~/Library/Caches".into(),
             matcher: m,
             suffixes: suffixes.iter().map(|s| s.to_string()).collect(),
@@ -297,7 +327,7 @@ mod tests {
 
     #[test]
     fn bundled_rules_are_valid() {
-        assert_eq!(RuleSet::bundled().locations.len(), 15);
+        assert_eq!(RuleSet::bundled().locations.len(), 22);
     }
 
     #[test]
@@ -378,9 +408,52 @@ mod tests {
         extra.id = "extra".into();
         user.locations.push(extra);
         let merged = RuleSet::bundled().merge(user);
-        assert_eq!(merged.locations.len(), 16);
+        assert_eq!(merged.locations.len(), 23);
         assert!(!merged.locations[0].default_checked);
-        assert_eq!(merged.locations[15].id, "extra");
+        assert_eq!(merged.locations[22].id, "extra");
+    }
+
+    #[test]
+    fn system_rules_are_scoped_and_resolved_below_the_system_root() {
+        let set = RuleSet::bundled();
+        let system: Vec<_> = set
+            .locations
+            .iter()
+            .filter(|l| l.scope == Scope::System)
+            .collect();
+        assert_eq!(system.len(), 7);
+        assert!(system.iter().all(|l| l.base.starts_with("/Library/")));
+        let mut env = Env::current();
+        env.system_root = PathBuf::from("/tmp/fake-root");
+        assert_eq!(
+            system[0].resolve(&env),
+            PathBuf::from("/tmp/fake-root/Library/Application Support")
+        );
+        let user = set
+            .locations
+            .iter()
+            .find(|l| l.scope == Scope::User)
+            .unwrap();
+        assert!(user.resolve(&env).starts_with(&env.home));
+    }
+
+    #[test]
+    fn scope_defaults_to_user_and_system_base_is_validated() {
+        let json = |scope: &str, base: &str| {
+            format!(
+                r#"{{"version":1,"locations":[{{"id":"a","category":"caches"{scope},"base":"{base}","match":"id","suffixes":[""],"default_checked":true}}]}}"#
+            )
+        };
+        let ok = RuleSet::from_json(&json("", "~/Library/X")).unwrap();
+        assert_eq!(ok.locations[0].scope, Scope::User);
+        let sys = r#","scope":"system""#;
+        assert!(RuleSet::from_json(&json(sys, "/Library/X")).is_ok());
+        assert!(RuleSet::from_json(&json(sys, "/Library/../etc")).is_err());
+        assert!(RuleSet::from_json(&json(sys, "/Library/")).is_err());
+        assert!(RuleSet::from_json(&json(sys, "/etc/X")).is_err());
+        assert!(RuleSet::from_json(&json(sys, "~/Library/X")).is_err());
+        assert!(RuleSet::from_json(&json("", "/Library/X")).is_err());
+        assert!(RuleSet::from_json(&json(r#","scope":"nope""#, "/Library/X")).is_err());
     }
 
     #[test]

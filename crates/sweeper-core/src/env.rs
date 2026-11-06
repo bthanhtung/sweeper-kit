@@ -21,6 +21,10 @@ pub struct Env {
     pub self_bundle_id: String,
     /// Sweeper Kit data directory (undo log); always protected.
     pub data_dir: PathBuf,
+    /// Root of the machine-wide file system (`/`). System-scope locations
+    /// such as `/Library/LaunchDaemons` resolve below it; tests point it at a
+    /// temporary directory.
+    pub system_root: PathBuf,
 }
 
 impl Env {
@@ -46,6 +50,7 @@ impl Env {
             uid: uid_of(&home),
             self_bundle_id: SELF_BUNDLE_ID.to_string(),
             data_dir: home.join("Library/Application Support/Sweeper Kit"),
+            system_root: PathBuf::from("/"),
             home,
         }
     }

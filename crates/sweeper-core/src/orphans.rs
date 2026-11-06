@@ -475,6 +475,7 @@ impl<'a> OrphanFinder<'a> {
             reason: reason.to_string(),
             refused,
             shared: false,
+            requires_admin: false,
         }
     }
 }
