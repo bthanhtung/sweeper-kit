@@ -52,12 +52,32 @@ fn canonicalize_lenient(path: &Path) -> PathBuf {
     }
 }
 
+/// `~/Library` subfolders that are removable roots.
+pub(crate) const LIBRARY_ROOT_DIRS: [&str; 12] = [
+    "Application Support",
+    "Containers",
+    "Group Containers",
+    "Application Scripts",
+    "Caches",
+    "HTTPStorages",
+    "WebKit",
+    "Preferences",
+    "Cookies",
+    "Saved Application State",
+    "Logs",
+    "LaunchAgents",
+];
+
 /// Decides which paths may be removed. Build once per [`Env`], call
 /// [`PathPolicy::check`] before every mutation.
 #[derive(Debug, Clone)]
 pub struct PathPolicy {
+    home: PathBuf,
     roots: Vec<PathBuf>,
     raw_roots: Vec<PathBuf>,
+    extra_roots: Vec<PathBuf>,
+    raw_extra_roots: Vec<PathBuf>,
+    rejected_extra_roots: Vec<PathBuf>,
     absolute_denies: Vec<(PathBuf, &'static str)>,
     containers: PathBuf,
     group_containers: PathBuf,
@@ -78,20 +98,7 @@ impl PathPolicy {
             .iter()
             .map(|p| canonicalize_lenient(p))
             .collect();
-        for sub in [
-            "Application Support",
-            "Containers",
-            "Group Containers",
-            "Application Scripts",
-            "Caches",
-            "HTTPStorages",
-            "WebKit",
-            "Preferences",
-            "Cookies",
-            "Saved Application State",
-            "Logs",
-            "LaunchAgents",
-        ] {
+        for sub in LIBRARY_ROOT_DIRS {
             roots.push(lib.join(sub));
             raw_roots.push(env.library().join(sub));
         }
@@ -130,8 +137,12 @@ impl PathPolicy {
         }
 
         PathPolicy {
+            home,
             roots,
             raw_roots,
+            extra_roots: Vec::new(),
+            raw_extra_roots: Vec::new(),
+            rejected_extra_roots: Vec::new(),
             absolute_denies,
             containers: lib.join("Containers"),
             group_containers: lib.join("Group Containers"),
@@ -140,6 +151,54 @@ impl PathPolicy {
             protected_ids,
             self_id: env.self_bundle_id.clone(),
         }
+    }
+
+    /// Adds removable roots outside the normal ones (e.g. `~/.npm`). A root
+    /// must lie strictly inside the home folder and must neither be inside nor
+    /// contain a hard-denied area (Keychains, Mail, Documents, ...); others are
+    /// ignored and listed by [`PathPolicy::rejected_extra_roots`]. Paths inside
+    /// an extra root that sits in the Downloads folder are allowed; every other
+    /// check still applies.
+    pub fn with_extra_roots(mut self, roots: &[PathBuf]) -> PathPolicy {
+        for raw in roots {
+            let canonical = canonicalize_lenient(raw);
+            if !self.is_valid_extra_root(&canonical) {
+                if !self.rejected_extra_roots.contains(raw) {
+                    self.rejected_extra_roots.push(raw.clone());
+                }
+                continue;
+            }
+            if !self.extra_roots.contains(&canonical) {
+                self.extra_roots.push(canonical);
+            }
+            if !self.raw_extra_roots.contains(raw) {
+                self.raw_extra_roots.push(raw.clone());
+            }
+        }
+        self
+    }
+
+    /// Extra roots that were refused by [`PathPolicy::with_extra_roots`].
+    pub fn rejected_extra_roots(&self) -> &[PathBuf] {
+        &self.rejected_extra_roots
+    }
+
+    fn is_valid_extra_root(&self, canonical: &Path) -> bool {
+        let downloads = self.home.join("Downloads");
+        let mut hard = self
+            .absolute_denies
+            .iter()
+            .map(|(dir, _)| dir)
+            .filter(|dir| **dir != downloads)
+            .chain(std::iter::once(&self.data_dir));
+        canonical.starts_with(&self.home)
+            && canonical != self.home
+            && !is_photos_library(canonical)
+            && !hard.any(|d| canonical.starts_with(d) || d.starts_with(canonical))
+    }
+
+    fn all_roots(&self) -> impl Iterator<Item = &PathBuf> {
+        self.roots.iter().chain(self.extra_roots.iter())
     }
 
     /// Validates `path` and returns its canonical form (parent canonicalized,
@@ -178,17 +237,20 @@ impl PathPolicy {
     /// True if an ancestor lexically inside an allowed root is a symlink.
     fn has_escaping_ancestor(&self, parent: &Path) -> bool {
         parent.ancestors().any(|a| {
-            self.raw_roots.iter().any(|r| a.starts_with(r))
+            self.raw_roots
+                .iter()
+                .chain(self.raw_extra_roots.iter())
+                .any(|r| a.starts_with(r))
                 && std::fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink())
         })
     }
 
     fn check_resolved(&self, canonical: &Path) -> Result<(), PolicyError> {
         self.check_denied(canonical)?;
-        if self.roots.iter().any(|r| r == canonical) {
+        if self.all_roots().any(|r| r == canonical) {
             return Err(PolicyError::OutsideAllowedRoots);
         }
-        if !self.roots.iter().any(|r| canonical.starts_with(r)) {
+        if !self.all_roots().any(|r| canonical.starts_with(r)) {
             return Err(PolicyError::OutsideAllowedRoots);
         }
         if self
@@ -203,18 +265,14 @@ impl PathPolicy {
 
     fn check_denied(&self, canonical: &Path) -> Result<(), PolicyError> {
         for (dir, why) in &self.absolute_denies {
-            if canonical.starts_with(dir) {
+            if canonical.starts_with(dir) && !self.opened_by_extra_root(canonical, dir) {
                 return Err(PolicyError::Denied(format!("{} ({why})", dir.display())));
             }
         }
         if canonical.starts_with(&self.data_dir) {
             return Err(PolicyError::Denied("Sweeper Kit's own data".into()));
         }
-        if canonical.components().any(|c| {
-            c.as_os_str()
-                .to_str()
-                .is_some_and(|s| s.to_ascii_lowercase().ends_with(".photoslibrary"))
-        }) {
+        if is_photos_library(canonical) {
             return Err(PolicyError::Denied("Photos library".into()));
         }
         if let Some(first) = first_below(canonical, &self.containers) {
@@ -230,10 +288,18 @@ impl PathPolicy {
         Ok(())
     }
 
+    /// True if an extra root lying inside the denied folder `dir` contains
+    /// `canonical`. Hard-denied folders never hold a valid extra root.
+    fn opened_by_extra_root(&self, canonical: &Path, dir: &Path) -> bool {
+        self.extra_roots
+            .iter()
+            .any(|r| r.starts_with(dir) && canonical.starts_with(r))
+    }
+
     /// Refuses `.app` bundles of Apple, Sweeper Kit itself or protected ids.
     fn check_bundles(&self, canonical: &Path) -> Result<(), PolicyError> {
         for a in canonical.ancestors() {
-            if self.roots.iter().any(|r| r == a) {
+            if self.all_roots().any(|r| r == a) {
                 break;
             }
             let is_app = a.extension().is_some_and(|e| e.eq_ignore_ascii_case("app"));
@@ -254,6 +320,14 @@ impl PathPolicy {
         }
         Ok(())
     }
+}
+
+fn is_photos_library(path: &Path) -> bool {
+    path.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.to_ascii_lowercase().ends_with(".photoslibrary"))
+    })
 }
 
 /// First path component of `path` below `base`, if `path` is inside `base`.

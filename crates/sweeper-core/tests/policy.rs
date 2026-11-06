@@ -227,3 +227,128 @@ fn app_with_apple_id_in_unusual_dir_is_denied_even_inside_bundle() {
         Err(PolicyError::Denied(_))
     ));
 }
+
+// ---- extra roots ----
+
+fn extra(fx: &Fixture, roots: &[&str]) -> PathPolicy {
+    let paths: Vec<PathBuf> = roots.iter().map(|r| fx.env.home.join(r)).collect();
+    policy(fx).with_extra_roots(&paths)
+}
+
+#[test]
+fn downloads_child_is_allowed_only_with_the_downloads_extra_root() {
+    let fx = Fixture::new();
+    let file = touch(&fx, "Downloads/old.zip");
+    assert!(matches!(
+        policy(&fx).check(&file),
+        Err(PolicyError::Denied(_))
+    ));
+
+    let p = extra(&fx, &["Downloads"]);
+    assert!(p.rejected_extra_roots().is_empty());
+    assert_eq!(p.check(&file).unwrap(), file);
+    // The root itself stays protected.
+    assert_eq!(
+        p.check(&fx.env.home.join("Downloads")),
+        Err(PolicyError::OutsideAllowedRoots)
+    );
+}
+
+#[test]
+fn personal_folders_stay_denied_and_their_extra_roots_rejected() {
+    let fx = Fixture::new();
+    let doc = touch(&fx, "Documents/thesis.txt");
+    let p = extra(
+        &fx,
+        &["Documents", "Desktop", "Library/Keychains", "Library/Mail"],
+    );
+    assert_eq!(p.rejected_extra_roots().len(), 4);
+    assert!(matches!(p.check(&doc), Err(PolicyError::Denied(_))));
+}
+
+#[test]
+fn extra_roots_containing_hard_denied_areas_are_rejected() {
+    let fx = Fixture::new();
+    let p = extra(&fx, &["", "Library", "Library/Application Support"]);
+    assert_eq!(p.rejected_extra_roots().len(), 3);
+    let stray = touch(&fx, "Library/Fonts/x.ttf");
+    assert_eq!(p.check(&stray), Err(PolicyError::OutsideAllowedRoots));
+}
+
+#[test]
+fn extra_root_outside_home_is_rejected() {
+    let fx = Fixture::new();
+    let outside = outside_dir(&fx);
+    let roots = [outside.clone(), PathBuf::from("/usr/local")];
+    let p = policy(&fx).with_extra_roots(&roots);
+    assert_eq!(p.rejected_extra_roots(), roots);
+    assert_eq!(
+        p.check(&outside.join("precious.txt")),
+        Err(PolicyError::OutsideAllowedRoots)
+    );
+}
+
+#[test]
+fn extra_root_that_is_a_symlink_out_of_home_is_rejected() {
+    let fx = Fixture::new();
+    let outside = outside_dir(&fx);
+    symlink(&outside, fx.env.home.join(".npm")).unwrap();
+    let p = extra(&fx, &[".npm"]);
+    assert_eq!(p.rejected_extra_roots().len(), 1);
+    assert_eq!(
+        p.check(&outside.join("precious.txt")),
+        Err(PolicyError::OutsideAllowedRoots)
+    );
+}
+
+#[test]
+fn symlink_inside_extra_root_pointing_outside_is_refused() {
+    let fx = Fixture::new();
+    let outside = outside_dir(&fx);
+    let cache = fx.env.home.join(".npm/_cacache");
+    touch(&fx, ".npm/_cacache/ok.bin");
+    let p = extra(&fx, &[".npm"]);
+    assert!(p.check(&cache).is_ok());
+
+    let link = cache.join("escape");
+    symlink(&outside, &link).unwrap();
+    assert_eq!(p.check(&link), Err(PolicyError::SymlinkEscape));
+    assert_eq!(
+        p.check(&link.join("precious.txt")),
+        Err(PolicyError::SymlinkEscape)
+    );
+
+    let docs = fx.env.home.join("Documents");
+    std::fs::create_dir_all(&docs).unwrap();
+    let to_docs = cache.join("to_docs");
+    symlink(&docs, &to_docs).unwrap();
+    assert_eq!(p.check(&to_docs), Err(PolicyError::SymlinkEscape));
+}
+
+#[test]
+fn extra_roots_keep_the_other_checks() {
+    let fx = Fixture::new();
+    let p = extra(&fx, &["Downloads", ".npm"]);
+    touch(&fx, "Downloads/Vacation.photoslibrary/db");
+    let photos = fx.env.home.join("Downloads/Vacation.photoslibrary/db");
+    assert!(matches!(p.check(&photos), Err(PolicyError::Denied(_))));
+    let apple = make_app(
+        &fx.env.home.join("Downloads"),
+        "Maps",
+        "com.apple.Maps",
+        "1",
+    );
+    assert!(matches!(p.check(&apple), Err(PolicyError::Denied(_))));
+    let own = make_app(&fx.env.home.join(".npm"), "Self", SELF_BUNDLE_ID, "1");
+    assert!(matches!(p.check(&own), Err(PolicyError::Denied(_))));
+
+    let keep = touch(&fx, ".npm/keep/file");
+    let protected = PathPolicy::new(&fx.env, &["~/.npm/keep".to_string()])
+        .with_extra_roots(&[fx.env.home.join(".npm")]);
+    assert_eq!(protected.check(&keep), Err(PolicyError::Protected));
+    // Without the extra root nothing changes.
+    assert_eq!(
+        policy(&fx).check(&keep),
+        Err(PolicyError::OutsideAllowedRoots)
+    );
+}
