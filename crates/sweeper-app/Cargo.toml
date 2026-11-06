@@ -1,0 +1,29 @@
+[package]
+name = "sweeper-app"
+version = "0.1.0"
+description = "Sweeper Kit desktop app: a free, offline macOS app uninstaller"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "sweeper_app"
+
+[[bin]]
+name = "sweeper-kit"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+sweeper-core = { path = "../sweeper-core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+sweeper-core = { path = "../sweeper-core", features = ["testing"] }
+tempfile.workspace = true

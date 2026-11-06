@@ -1,0 +1,395 @@
+//! Command layer: plain functions over an [`AppContext`] plus the thin
+//! `#[tauri::command]` wrappers. Every filesystem decision is made by
+//! `sweeper-core`; nothing here touches files except the settings store.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
+use std::time::Duration;
+
+use serde::Serialize;
+use sweeper_core::{
+    apply_preset as core_apply_preset, brew_zap_command as core_brew_zap_command, compute_sizes,
+    full_disk_access, team_id, AppCatalog, AppInfo, FdaStatus, LeftoverScanner, Preset, Progress,
+    QuitOutcome, RemovalMode, RemovalPlan, Remover, RunningApp, ScanResult, StepResult, UndoEntry,
+    UndoLog, UninstallReport, Uninstaller,
+};
+
+use crate::state::{lock, save_settings as store_settings, AppContext, AppState, Settings};
+
+/// Error message sent when an operation was superseded; the UI ignores it.
+pub const CANCELLED: &str = "cancelled";
+/// How long an app gets to quit before the UI offers to force it.
+pub const QUIT_GRACE: Duration = Duration::from_secs(5);
+/// Apps sized per batch, so sizes reach the UI progressively.
+const SIZE_BATCH: usize = 8;
+
+/// Payload of the `app-sizes` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SizeUpdate {
+    pub path: PathBuf,
+    pub size: u64,
+}
+
+// ---- plain functions -------------------------------------------------------
+
+/// Installed apps over the default and extra app folders. Sizes are filled in
+/// separately by [`app_sizes`].
+pub fn list_apps(ctx: &AppContext) -> Vec<AppInfo> {
+    let apps = AppCatalog::scan(&ctx.env, &*ctx.spotlight);
+    *lock(&ctx.installed) = apps.clone();
+    apps
+}
+
+/// Computes bundle sizes in batches and reports each as it is known.
+pub fn app_sizes(apps: &[AppInfo], cancel: &AtomicBool, emit: &mut dyn FnMut(SizeUpdate)) {
+    for batch in apps.chunks(SIZE_BATCH) {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut batch = batch.to_vec();
+        compute_sizes(&mut batch, cancel);
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        for app in batch {
+            if let Some(size) = app.size {
+                emit(SizeUpdate {
+                    path: app.path,
+                    size,
+                });
+            }
+        }
+    }
+}
+
+/// Finds the app at `path`: in the cached list, otherwise as a one-off built
+/// from its Info.plist by cataloguing its parent folder.
+fn resolve_app(ctx: &AppContext, path: &Path) -> Result<AppInfo, String> {
+    let is_app = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("app"));
+    if !path.is_absolute() || !is_app || !path.is_dir() {
+        return Err(format!("{} is not an application bundle", path.display()));
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+    let same = |a: &AppInfo| {
+        a.path == path || std::fs::canonicalize(&a.path).is_ok_and(|p| p == canonical)
+    };
+    if let Some(app) = ctx.installed_apps().into_iter().find(same) {
+        return Ok(app);
+    }
+    let parent = path.parent().ok_or("The app has no parent folder")?;
+    let mut env = ctx.env.clone();
+    env.app_dirs = vec![parent.to_path_buf()];
+    AppCatalog::scan(&env, &*ctx.spotlight)
+        .into_iter()
+        .find(same)
+        .ok_or_else(|| format!("{} has no readable Info.plist", path.display()))
+}
+
+/// Scans leftovers of the app at `path` with the Everything preset applied.
+pub fn scan_app(ctx: &AppContext, path: &Path, cancel: &AtomicBool) -> Result<ScanResult, String> {
+    let mut app = resolve_app(ctx, path)?;
+    if app.team_id.is_none() {
+        app.team_id = team_id(&app.path, &*ctx.runner);
+    }
+    let installed = ctx.installed_apps();
+    let scanner = LeftoverScanner::new(&ctx.env, &ctx.rules, &ctx.policy, &*ctx.spotlight);
+    let mut result = scanner.scan(&app, &installed, cancel);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CANCELLED.into());
+    }
+    core_apply_preset(&mut result, Preset::Everything);
+    Ok(result)
+}
+
+pub fn apply_preset(mut scan: ScanResult, preset: Preset) -> ScanResult {
+    core_apply_preset(&mut scan, preset);
+    scan
+}
+
+/// Dry run: exactly what an uninstall would remove.
+pub fn plan_removal(scan: &ScanResult) -> RemovalPlan {
+    RemovalPlan::from_scan(scan)
+}
+
+fn with_uninstaller<R>(ctx: &AppContext, body: impl FnOnce(&Uninstaller<'_>) -> R) -> R {
+    let installed = ctx.installed_apps();
+    let scanner = LeftoverScanner::new(&ctx.env, &ctx.rules, &ctx.policy, &*ctx.spotlight);
+    let remover = Remover::new(
+        &ctx.env,
+        &ctx.policy,
+        &*ctx.trasher,
+        UndoLog::for_env(&ctx.env),
+    );
+    let uninstaller = Uninstaller::new(
+        &ctx.env,
+        &ctx.policy,
+        &*ctx.runner,
+        &*ctx.processes,
+        &remover,
+        &scanner,
+        &installed,
+    );
+    body(&uninstaller)
+}
+
+pub fn running_instances(ctx: &AppContext, scan: &ScanResult) -> Vec<RunningApp> {
+    with_uninstaller(ctx, |u| u.running_instances(scan))
+}
+
+/// Quits the running instances of the scanned app, waiting [`QUIT_GRACE`].
+/// The instances are looked up again here so the UI cannot name other processes.
+pub fn quit_apps(ctx: &AppContext, scan: &ScanResult, allow_force: bool) -> QuitOutcome {
+    quit_apps_within(ctx, scan, allow_force, QUIT_GRACE)
+}
+
+pub fn quit_apps_within(
+    ctx: &AppContext,
+    scan: &ScanResult,
+    allow_force: bool,
+    grace: Duration,
+) -> QuitOutcome {
+    with_uninstaller(ctx, |u| {
+        let apps = u.running_instances(scan);
+        for app in &apps {
+            ctx.log
+                .record(if allow_force { "force-quit" } else { "quit" }, &app.path);
+        }
+        u.quit(&apps, grace, allow_force)
+    })
+}
+
+/// Removes the checked items (Trash unless the setting says otherwise).
+pub fn uninstall(
+    ctx: &AppContext,
+    scan: &ScanResult,
+    progress: &mut dyn FnMut(Progress),
+) -> Result<UninstallReport, String> {
+    if scan.app.is_apple {
+        return Err("Apple apps are read-only and cannot be uninstalled".into());
+    }
+    let mode = if ctx.settings.delete_immediately {
+        RemovalMode::Delete
+    } else {
+        RemovalMode::Trash
+    };
+    ctx.log.record("uninstall", &scan.app.path);
+    Ok(with_uninstaller(ctx, |u| u.run(scan, mode, progress)))
+}
+
+/// The cask of `app` as looked up in the installed list, never trusting the UI.
+fn installed_copy(ctx: &AppContext, app: &AppInfo) -> AppInfo {
+    ctx.installed_apps()
+        .into_iter()
+        .find(|a| a.path == app.path && a.bundle_id == app.bundle_id)
+        .unwrap_or_else(|| app.clone())
+}
+
+pub fn brew_zap_command(ctx: &AppContext, app: &AppInfo) -> Option<Vec<String>> {
+    core_brew_zap_command(&installed_copy(ctx, app))
+}
+
+pub fn brew_zap(ctx: &AppContext, app: &AppInfo) -> StepResult {
+    let app = installed_copy(ctx, app);
+    ctx.log.record("brew-zap", &app.path);
+    with_uninstaller(ctx, |u| u.run_brew_zap(&app))
+}
+
+pub fn fda_status(ctx: &AppContext) -> FdaStatus {
+    full_disk_access(&ctx.env)
+}
+
+/// Validates `path` for "Show in Finder": it must pass the path policy or be
+/// one of the app folders. Returns the path to reveal.
+pub fn reveal_target(ctx: &AppContext, path: &Path) -> Result<PathBuf, String> {
+    if ctx.env.app_dirs.iter().any(|d| d == path) {
+        return Ok(path.to_path_buf());
+    }
+    ctx.policy.check(path).map_err(|e| e.to_string())
+}
+
+pub fn get_settings(ctx: &AppContext) -> Settings {
+    ctx.settings.clone()
+}
+
+pub fn save_settings(ctx: &mut AppContext, settings: &Settings) -> Result<Settings, String> {
+    store_settings(ctx, settings)
+}
+
+/// Items moved to the Trash by earlier uninstalls.
+pub fn undo_entries(ctx: &AppContext) -> Result<Vec<UndoEntry>, String> {
+    UndoLog::for_env(&ctx.env)
+        .entries()
+        .map_err(|e| format!("Could not read the undo list: {e}"))
+}
+
+// ---- Tauri wrappers --------------------------------------------------------
+
+type Ctx = Arc<RwLock<AppContext>>;
+
+fn read(ctx: &Ctx) -> RwLockReadGuard<'_, AppContext> {
+    ctx.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Runs `work` on the blocking pool so the UI never waits on the filesystem.
+async fn blocking<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("Background task failed: {e}"))
+}
+
+pub mod wrappers {
+    use tauri::{AppHandle, Emitter, State};
+    use tauri_plugin_opener::OpenerExt;
+
+    use super::*;
+
+    #[tauri::command]
+    pub async fn list_apps(
+        app: AppHandle,
+        state: State<'_, AppState>,
+    ) -> Result<Vec<AppInfo>, String> {
+        let ctx = state.ctx.clone();
+        let apps = blocking(move || super::list_apps(&read(&ctx))).await?;
+        let cancel = state.sizes_cancel.renew();
+        let for_sizes = apps.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            app_sizes(&for_sizes, &cancel, &mut |update| {
+                let _ = app.emit("app-sizes", update);
+            });
+        });
+        Ok(apps)
+    }
+
+    #[tauri::command]
+    pub async fn scan_app(state: State<'_, AppState>, path: PathBuf) -> Result<ScanResult, String> {
+        let ctx = state.ctx.clone();
+        let cancel = state.scan_cancel.renew();
+        blocking(move || super::scan_app(&read(&ctx), &path, &cancel)).await?
+    }
+
+    #[tauri::command]
+    pub fn apply_preset(scan: ScanResult, preset: Preset) -> ScanResult {
+        super::apply_preset(scan, preset)
+    }
+
+    #[tauri::command]
+    pub fn plan_removal(scan: ScanResult) -> RemovalPlan {
+        super::plan_removal(&scan)
+    }
+
+    #[tauri::command]
+    pub async fn running_instances(
+        state: State<'_, AppState>,
+        scan: ScanResult,
+    ) -> Result<Vec<RunningApp>, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || super::running_instances(&read(&ctx), &scan)).await
+    }
+
+    #[tauri::command]
+    pub async fn quit_apps(
+        state: State<'_, AppState>,
+        scan: ScanResult,
+        allow_force: bool,
+    ) -> Result<QuitOutcome, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || super::quit_apps(&read(&ctx), &scan, allow_force)).await
+    }
+
+    #[tauri::command]
+    pub async fn uninstall(
+        app: AppHandle,
+        state: State<'_, AppState>,
+        scan: ScanResult,
+    ) -> Result<UninstallReport, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || {
+            super::uninstall(&read(&ctx), &scan, &mut |p| {
+                let _ = app.emit("uninstall-progress", p);
+            })
+        })
+        .await?
+    }
+
+    #[tauri::command]
+    pub async fn brew_zap_command(
+        state: State<'_, AppState>,
+        app: AppInfo,
+    ) -> Result<Option<Vec<String>>, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || super::brew_zap_command(&read(&ctx), &app)).await
+    }
+
+    #[tauri::command]
+    pub async fn brew_zap(state: State<'_, AppState>, app: AppInfo) -> Result<StepResult, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || super::brew_zap(&read(&ctx), &app)).await
+    }
+
+    #[tauri::command]
+    pub async fn fda_status(state: State<'_, AppState>) -> Result<FdaStatus, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || super::fda_status(&read(&ctx))).await
+    }
+
+    #[tauri::command]
+    pub fn open_fda_settings(app: AppHandle) -> Result<(), String> {
+        app.opener()
+            .open_url(sweeper_core::FDA_SETTINGS_URL, None::<&str>)
+            .map_err(|e| format!("Could not open System Settings: {e}"))
+    }
+
+    #[tauri::command]
+    pub fn reveal_in_finder(
+        app: AppHandle,
+        state: State<'_, AppState>,
+        path: PathBuf,
+    ) -> Result<(), String> {
+        let target = reveal_target(&read(&state.ctx), &path)?;
+        app.opener()
+            .reveal_item_in_dir(target)
+            .map_err(|e| format!("Could not reveal the item: {e}"))
+    }
+
+    #[tauri::command]
+    pub fn get_settings(state: State<'_, AppState>) -> Settings {
+        super::get_settings(&read(&state.ctx))
+    }
+
+    #[tauri::command]
+    pub async fn save_settings(
+        state: State<'_, AppState>,
+        settings: Settings,
+    ) -> Result<Settings, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || {
+            let mut ctx = ctx.write().unwrap_or_else(|e| e.into_inner());
+            super::save_settings(&mut ctx, &settings)
+        })
+        .await?
+    }
+
+    #[tauri::command]
+    pub async fn undo_entries(state: State<'_, AppState>) -> Result<Vec<UndoEntry>, String> {
+        let ctx = state.ctx.clone();
+        blocking(move || super::undo_entries(&read(&ctx))).await?
+    }
+
+    #[tauri::command]
+    pub fn rules_warning(state: State<'_, AppState>) -> Option<String> {
+        read(&state.ctx).rules_warning.clone()
+    }
+
+    /// The app handed over before the UI started listening, if any.
+    #[tauri::command]
+    pub fn take_pending_open(state: State<'_, AppState>) -> Option<PathBuf> {
+        lock(&state.pending_open).take()
+    }
+}

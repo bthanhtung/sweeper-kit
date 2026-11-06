@@ -1,0 +1,49 @@
+{
+  "productName": "Sweeper Kit",
+  "version": "0.1.0",
+  "identifier": "dev.sweeperkit.app",
+  "build": {
+    "frontendDist": "../../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Sweeper Kit",
+        "width": 1120,
+        "height": 740,
+        "minWidth": 880,
+        "minHeight": 540
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src ipc:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app"],
+    "category": "Utility",
+    "shortDescription": "Free, offline app uninstaller",
+    "copyright": "MIT License",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "14.0"
+    },
+    "fileAssociations": [
+      {
+        "ext": ["app"],
+        "name": "Application",
+        "description": "macOS application to uninstall",
+        "role": "Viewer"
+      }
+    ]
+  }
+}

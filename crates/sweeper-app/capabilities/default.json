@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "description": "Minimum the UI needs: IPC with the command layer, events, and native dialogs. System Settings and Finder are opened by Rust commands that validate their input, so no opener permission is exposed to the webview.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "dialog:allow-open",
+    "dialog:allow-ask"
+  ]
+}
