@@ -1,0 +1,113 @@
+name: Build DMG
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for the DMG name, e.g. 0.1.0 (empty = short commit SHA)"
+        type: string
+        default: ""
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Universal DMG
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      INPUT_VERSION: ${{ inputs.version }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --target aarch64-apple-darwin,x86_64-apple-darwin --component rustfmt,clippy
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Format, lint and test
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo test --workspace --all-features
+
+      - name: Install Tauri CLI
+        run: |
+          set -euo pipefail
+          if cargo tauri --version >/dev/null 2>&1; then
+            echo "Tauri CLI already installed: $(cargo tauri --version)"
+          else
+            cargo install tauri-cli --version "^2" --locked
+          fi
+
+      - name: Build universal DMG
+        working-directory: crates/sweeper-app
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: |
+          set -euo pipefail
+          cargo tauri build --target universal-apple-darwin --bundles dmg
+
+      - name: Package DMG and checksum
+        id: package
+        run: |
+          set -euo pipefail
+
+          version="${INPUT_VERSION}"
+          if [[ -z "$version" ]]; then
+            version="${GITHUB_SHA::7}"
+          fi
+          if [[ ! "$version" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+            echo "::error::Invalid version '${version}': use letters, digits, '.', '_' or '-' (max 64 characters)" >&2
+            exit 1
+          fi
+
+          dmgs=(target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          if [[ ${#dmgs[@]} -ne 1 || ! -f "${dmgs[0]}" ]]; then
+            echo "::error::Expected exactly one DMG, found ${#dmgs[@]}" >&2
+            exit 1
+          fi
+
+          name="Sweeper-Kit-${version}-universal.dmg"
+          mkdir -p dist
+          cp "${dmgs[0]}" "dist/${name}"
+          (cd dist && shasum -a 256 "${name}" > "${name}.sha256")
+          read -r hash _ < "dist/${name}.sha256"
+
+          {
+            echo "### Sweeper Kit DMG"
+            echo
+            echo "- File: \`${name}\`"
+            echo "- SHA-256: \`${hash}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: sweeper-kit-universal-dmg
+          path: |
+            dist/${{ steps.package.outputs.name }}
+            dist/${{ steps.package.outputs.name }}.sha256
+          if-no-files-found: error
+          retention-days: 30
