@@ -465,3 +465,327 @@ fn history_write_failure_is_only_a_warning() {
         .any(|w| w.contains("removal history")));
     assert!(!fx.apps_dir.join("Foo.app").exists());
 }
+
+// ------------------------------------------------------ administrator scope
+
+mod admin_scope {
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use sweeper_core::testing::write_file;
+    use sweeper_core::{
+        AdminManifest, AdminOp, AdminResult, OpResult, StepResult, UninstallReport,
+    };
+
+    const OSASCRIPT: &str = "/usr/bin/osascript";
+    const NEEDS_ADMIN: &str = "needs administrator access";
+
+    /// A Foo install with user leftovers plus a system daemon and helper tool.
+    fn with_system_items() -> (Fixture, PathBuf, PathBuf) {
+        let fx = populated();
+        let daemon = fx.sys("Library/LaunchDaemons/com.foo.app.helper.plist");
+        let tool = fx.sys("Library/PrivilegedHelperTools/com.foo.app.helper");
+        write_file(&daemon, 100);
+        write_file(&tool, 100);
+        (fx, daemon, tool)
+    }
+
+    fn helper_binary(fx: &Fixture) -> PathBuf {
+        let p = fx.tmp.path().join("sweeper-helper");
+        write_file(&p, 10);
+        p
+    }
+
+    fn uninstall(
+        fx: &Fixture,
+        runner: &RecordingRunner,
+        helper: Option<&Path>,
+        receipts: &[&str],
+    ) -> UninstallReport {
+        let apps = installed(fx);
+        let app = app_by_id(&apps, FOO);
+        let policy = PathPolicy::new(&fx.env, &[]);
+        let rules = RuleSet::bundled();
+        let spot = FakeSpotlight::default();
+        let scanner = LeftoverScanner::new(&fx.env, &rules, &policy, &spot);
+        let trash = FakeTrash::new(fx.trash_dir.clone());
+        let remover = Remover::new(&fx.env, &policy, &trash, UndoLog::for_env(&fx.env));
+        let processes = FakeProcesses::new();
+        let mut u = Uninstaller::new(
+            &fx.env, &policy, runner, &processes, &remover, &scanner, &apps,
+        )
+        .with_forget_receipts(receipts.iter().map(|s| s.to_string()).collect());
+        if let Some(helper) = helper {
+            u = u.with_admin_helper(helper);
+        }
+        let scan = scanner.scan(&app, &apps, &std::sync::atomic::AtomicBool::new(false));
+        u.run(&scan, RemovalMode::Trash, &mut |_| {})
+    }
+
+    fn staged(fx: &Fixture, name: &str) -> PathBuf {
+        fx.sys("Library/Application Support/Sweeper Kit/Staging/batch")
+            .join(name)
+    }
+
+    fn moved(path: &Path) -> OpResult {
+        OpResult {
+            ok: true,
+            detail: path.display().to_string(),
+            staging_path: Some(path.to_path_buf()),
+        }
+    }
+
+    fn plain(ok: bool, detail: &str) -> OpResult {
+        OpResult {
+            ok,
+            detail: detail.into(),
+            staging_path: None,
+        }
+    }
+
+    fn script(runner: &RecordingRunner, ops: Vec<OpResult>) {
+        runner.respond(
+            OSASCRIPT,
+            CommandOutput {
+                stdout: serde_json::to_string(&AdminResult { ops }).unwrap(),
+                ..CommandOutput::default()
+            },
+        );
+    }
+
+    fn cancel(runner: &RecordingRunner) {
+        runner.respond(
+            OSASCRIPT,
+            CommandOutput {
+                status: 1,
+                stderr: "execution error: User canceled. (-128)".into(),
+                ..CommandOutput::default()
+            },
+        );
+    }
+
+    fn sent_manifest(runner: &RecordingRunner) -> AdminManifest {
+        let calls = runner.calls_of(OSASCRIPT);
+        assert_eq!(calls.len(), 1, "exactly one administrator prompt");
+        serde_json::from_str(calls[0].last().unwrap()).unwrap()
+    }
+
+    fn undo(fx: &Fixture) -> Vec<sweeper_core::UndoEntry> {
+        UndoLog::for_env(&fx.env).entries().unwrap()
+    }
+
+    #[test]
+    fn mixed_plan_uses_one_prompt_and_records_admin_moves_for_undo() {
+        let (fx, daemon, tool) = with_system_items();
+        let helper = helper_binary(&fx);
+        let runner = RecordingRunner::new();
+        let s_daemon = staged(&fx, "1-com.foo.app.helper.plist");
+        let s_tool = staged(&fx, "2-com.foo.app.helper");
+        script(
+            &runner,
+            vec![
+                plain(true, "booted out"),
+                moved(&s_daemon),
+                moved(&s_tool),
+                plain(true, "com.foo.app.pkg"),
+            ],
+        );
+        let report = uninstall(&fx, &runner, Some(&helper), &["com.foo.app.pkg"]);
+
+        // One invocation carrying bootout, both moves and the receipt.
+        let manifest = sent_manifest(&runner);
+        assert_eq!(manifest.user_uid, 501);
+        assert_eq!(
+            manifest.ops,
+            vec![
+                AdminOp::Bootout {
+                    plist: daemon.clone()
+                },
+                AdminOp::MoveToStaging {
+                    path: daemon.clone()
+                },
+                AdminOp::MoveToStaging { path: tool.clone() },
+                AdminOp::ForgetReceipt {
+                    pkg_id: "com.foo.app.pkg".into()
+                },
+            ]
+        );
+
+        // The user part is done through the Trash as before.
+        assert!(!fx.apps_dir.join("Foo.app").exists());
+        assert!(!fx.env.home.join("Library/Caches/com.foo.app").exists());
+        let step = report.admin.expect("admin step");
+        assert!(step.ok, "{step:?}");
+        assert_eq!(step.detail, "4 done, 0 failed");
+
+        let originals: Vec<&PathBuf> = report.removal.removed.iter().map(|r| &r.original).collect();
+        assert!(originals.contains(&&daemon) && originals.contains(&&tool));
+        assert!(
+            report.removal.failed.is_empty(),
+            "{:?}",
+            report.removal.failed
+        );
+
+        // Undo log: admin entries point at the staging paths and are flagged.
+        let entries = undo(&fx);
+        let admin: Vec<_> = entries.iter().filter(|e| e.admin).collect();
+        assert_eq!(admin.len(), 2);
+        assert!(admin
+            .iter()
+            .any(|e| e.original == daemon && e.trash_location == s_daemon));
+        assert!(admin
+            .iter()
+            .any(|e| e.original == tool && e.trash_location == s_tool));
+        assert!(admin.iter().all(|e| e.batch_id == manifest.batch_id));
+        assert!(entries.iter().filter(|e| !e.admin).count() >= 3);
+    }
+
+    #[test]
+    fn without_a_helper_admin_items_remain_with_a_reason() {
+        let (fx, daemon, tool) = with_system_items();
+        let runner = RecordingRunner::new();
+        let report = uninstall(&fx, &runner, None, &[]);
+
+        assert!(runner.calls_of(OSASCRIPT).is_empty());
+        assert_eq!(
+            report.admin,
+            Some(StepResult {
+                name: "Administrator tasks".into(),
+                ok: false,
+                detail: NEEDS_ADMIN.into(),
+            })
+        );
+        for path in [&daemon, &tool] {
+            assert!(path.exists());
+            assert!(
+                report
+                    .remaining
+                    .iter()
+                    .any(|(p, why)| p == path && why == NEEDS_ADMIN),
+                "{:?}",
+                report.remaining
+            );
+        }
+        // User items were still removed.
+        assert!(!fx.apps_dir.join("Foo.app").exists());
+        assert!(undo(&fx).iter().all(|e| !e.admin));
+    }
+
+    #[test]
+    fn cancelled_authorization_is_reported_and_the_user_part_is_done() {
+        let (fx, daemon, _tool) = with_system_items();
+        let helper = helper_binary(&fx);
+        let runner = RecordingRunner::new();
+        cancel(&runner);
+        let report = uninstall(&fx, &runner, Some(&helper), &[]);
+
+        assert_eq!(runner.calls_of(OSASCRIPT).len(), 1);
+        let step = report.admin.expect("admin step");
+        assert!(!step.ok);
+        assert_eq!(step.detail, "Administrator authorization was cancelled");
+        assert!(daemon.exists());
+        assert!(report
+            .remaining
+            .iter()
+            .any(|(p, why)| *p == daemon && why == NEEDS_ADMIN));
+        assert!(!fx.apps_dir.join("Foo.app").exists());
+        assert!(!fx.env.home.join("Library/Caches/com.foo.app").exists());
+        assert!(undo(&fx).iter().all(|e| !e.admin));
+    }
+
+    #[test]
+    fn a_failed_admin_move_is_reported_per_item() {
+        let (fx, daemon, tool) = with_system_items();
+        let helper = helper_binary(&fx);
+        let runner = RecordingRunner::new();
+        script(
+            &runner,
+            vec![
+                plain(true, "booted out"),
+                plain(false, "Operation not permitted"),
+                moved(&staged(&fx, "2-com.foo.app.helper")),
+            ],
+        );
+        let report = uninstall(&fx, &runner, Some(&helper), &[]);
+        let step = report.admin.expect("admin step");
+        assert!(!step.ok);
+        assert!(
+            step.detail.starts_with("2 done, 1 failed"),
+            "{}",
+            step.detail
+        );
+        assert!(report
+            .removal
+            .failed
+            .iter()
+            .any(|(p, why)| *p == daemon && why == "Operation not permitted"));
+        assert!(report.removal.removed.iter().any(|r| r.original == tool));
+        assert_eq!(undo(&fx).iter().filter(|e| e.admin).count(), 1);
+    }
+
+    #[test]
+    fn helper_problems_do_not_break_the_user_part() {
+        let (fx, daemon, _tool) = with_system_items();
+        let runner = RecordingRunner::new();
+        // The helper binary is missing.
+        let report = uninstall(&fx, &runner, Some(&fx.tmp.path().join("missing")), &[]);
+        let step = report.admin.expect("admin step");
+        assert!(!step.ok);
+        assert!(step.detail.contains("helper is missing"), "{}", step.detail);
+        assert!(runner.calls_of(OSASCRIPT).is_empty());
+        assert!(report
+            .remaining
+            .iter()
+            .any(|(p, why)| *p == daemon && why == NEEDS_ADMIN));
+        assert!(!fx.apps_dir.join("Foo.app").exists());
+    }
+
+    #[test]
+    fn receipts_alone_need_one_prompt_or_a_helper() {
+        let fx = populated();
+        let helper = helper_binary(&fx);
+        let runner = RecordingRunner::new();
+        script(&runner, vec![plain(true, "com.foo.app.pkg")]);
+        let report = uninstall(&fx, &runner, Some(&helper), &["com.foo.app.pkg"]);
+        assert_eq!(
+            sent_manifest(&runner).ops,
+            vec![AdminOp::ForgetReceipt {
+                pkg_id: "com.foo.app.pkg".into()
+            }]
+        );
+        assert!(report.admin.unwrap().ok);
+
+        let fx = populated();
+        let runner = RecordingRunner::new();
+        let report = uninstall(&fx, &runner, None, &["com.foo.app.pkg"]);
+        assert!(!report.admin.unwrap().ok);
+        assert!(runner.calls_of(OSASCRIPT).is_empty());
+    }
+
+    #[test]
+    fn invalid_receipt_ids_are_skipped_with_a_warning() {
+        let fx = populated();
+        let helper = helper_binary(&fx);
+        let runner = RecordingRunner::new();
+        let report = uninstall(
+            &fx,
+            &runner,
+            Some(&helper),
+            &["-rf", "com.apple.pkg.X", "a b"],
+        );
+        assert!(runner.calls_of(OSASCRIPT).is_empty());
+        assert!(report.admin.is_none());
+        assert_eq!(report.removal.warnings.len(), 3);
+    }
+
+    #[test]
+    fn user_only_uninstall_never_asks_for_administrator_access() {
+        let fx = populated();
+        let helper = helper_binary(&fx);
+        let runner = RecordingRunner::new();
+        let report = uninstall(&fx, &runner, Some(&helper), &[]);
+        assert!(runner.calls_of(OSASCRIPT).is_empty());
+        assert!(report.admin.is_none());
+        assert!(report.remaining.is_empty(), "{:?}", report.remaining);
+    }
+}
