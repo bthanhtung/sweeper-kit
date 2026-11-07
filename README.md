@@ -2,6 +2,10 @@
 
 A free, open-source (MIT), fully offline app uninstaller for macOS. Pick an app, see every file it left in your Library, review the exact list, and move it all to the Trash.
 
+![Sweeper Kit demo: uninstall with dry run, leftover finder and cache cleaner](docs/demo.gif)
+
+<sub>UI demo with sample data (fictional apps), recorded from the real interface via the browser harness in [`docs/demo/`](docs/demo/). Serve the repo root (`python3 -m http.server`) and open `/docs/demo/` to try it.</sub>
+
 ## What it does
 
 - Lists the apps in `/Applications`, `/Applications/Utilities`, `~/Applications` and any folders you add, with version, bundle identifier, size, last-used date and source (App Store, Homebrew or other).
