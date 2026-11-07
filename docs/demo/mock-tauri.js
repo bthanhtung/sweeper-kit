@@ -395,6 +395,13 @@
       ? { name: 'Removed system items', ok: true, detail: `${adminCount} items moved to the staging folder` }
       : null;
 
+    // The removal also lands in History, as the real app records it.
+    const now = Math.floor(Date.now() / 1000);
+    const batchId = `batch-${String(batches.length + 1).padStart(4, '0')}`;
+    batches.unshift(batch(batchId, now, removed.map((r, index) => historyEntry(
+      `e-${batchId}-${index}`, batchId, now, r.original, r.trash_location, r.size, { admin: adminPaths.has(r.original) },
+    ))));
+
     forgetInstalled(scan.app);
     return { steps, removal: { removed, failed: [], warnings: [] }, admin, remaining: [] };
   }

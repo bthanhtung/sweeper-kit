@@ -1,0 +1,103 @@
+<!doctype html>
+<!-- Recording stage: the real UI (index.html) in a macOS-style window, driven by director.js. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sweeper Kit demo stage</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #d9dbe8; }
+    body { font: 13px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif; }
+
+    #stage {
+      position: relative;
+      width: 1280px;
+      height: 800px;
+      overflow: hidden;
+      background:
+        radial-gradient(900px 600px at 18% 12%, #f3e8ff 0%, rgba(243, 232, 255, 0) 70%),
+        radial-gradient(900px 640px at 85% 90%, #cfe6ff 0%, rgba(207, 230, 255, 0) 70%),
+        linear-gradient(135deg, #e4e7f6 0%, #d3dcf2 100%);
+    }
+
+    #window {
+      position: absolute;
+      left: 80px;
+      top: 46px;
+      width: 1120px;
+      height: 700px;
+      border-radius: 12px;
+      overflow: hidden;
+      background: #fff;
+      box-shadow:
+        0 0 0 0.5px rgba(0, 0, 0, 0.28),
+        0 2px 6px rgba(30, 40, 90, 0.12),
+        0 30px 70px rgba(30, 40, 90, 0.28);
+      opacity: 0;
+    }
+    #window iframe { display: block; width: 1120px; height: 700px; border: 0; color-scheme: light; }
+
+    /* Overlay title bar: the UI reserves room for the lights above its sidebar title. */
+    #lights { position: absolute; left: 14px; top: 14px; display: flex; gap: 8px; }
+    #lights span { width: 12px; height: 12px; border-radius: 50%; box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.18); }
+    #lights .close { background: #ff5f57; }
+    #lights .min { background: #febc2e; }
+    #lights .zoom { background: #28c840; }
+
+    #caption {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 12px;
+      margin: 0;
+      text-align: center;
+      font-size: 12px;
+      letter-spacing: 0.02em;
+      color: #5b6178;
+    }
+
+    #cursor {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 22px;
+      height: 28px;
+      pointer-events: none;
+      opacity: 0;
+      will-change: transform;
+      filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.35));
+    }
+    #cursor svg { display: block; width: 22px; height: 28px; transform-origin: 3px 2px; }
+    #ripple {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 34px;
+      height: 34px;
+      margin: -17px 0 0 -17px;
+      border-radius: 50%;
+      background: rgba(0, 122, 255, 0.28);
+      border: 1.5px solid rgba(0, 122, 255, 0.55);
+      pointer-events: none;
+      opacity: 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <div id="window" role="img" aria-label="Sweeper Kit window">
+      <iframe id="app" src="index.html" title="Sweeper Kit"></iframe>
+      <div id="lights" aria-hidden="true"><span class="close"></span><span class="min"></span><span class="zoom"></span></div>
+    </div>
+    <p id="caption">UI demo with sample data</p>
+    <div id="ripple"></div>
+    <div id="cursor" aria-hidden="true">
+      <svg viewBox="0 0 22 28" fill="none">
+        <path d="M3 2 3 22.5 8.2 17.8 11.6 25.4 15.1 23.9 11.8 16.4 18.8 16.2Z" fill="#111" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/>
+      </svg>
+    </div>
+  </div>
+  <script src="director.js"></script>
+</body>
+</html>

@@ -4,7 +4,7 @@ A free, open-source (MIT), fully offline app uninstaller for macOS. Pick an app,
 
 ![Sweeper Kit demo: uninstall with dry run, leftover finder and cache cleaner](docs/demo.gif)
 
-<sub>UI demo with sample data (fictional apps), recorded from the real interface via the browser harness in [`docs/demo/`](docs/demo/). Serve the repo root (`python3 -m http.server`) and open `/docs/demo/` to try it.</sub>
+<sub>UI demo with sample data (fictional apps), recorded from the real interface by a scripted run of the browser harness in [`docs/demo/`](docs/demo/). To try it, serve the repo root (`python3 -m http.server`) and open `/docs/demo/`. To re-record, run `node --experimental-websocket docs/demo/record.mjs` from the repo root (needs Chrome and ffmpeg).</sub>
 
 ## What it does
 
